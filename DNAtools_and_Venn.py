@@ -79,7 +79,7 @@ def create_venn_html(sets, keys):
     # Create the data-dependent Venn diagram
     fig = plt.figure(figsize=(8, 8))
     plt.clf()
-    venny4py(sets=sets)
+    venny4py(labels=keys, sets=sets)
     ax = plt.gca()
     ax.annotate('A', xy=((51 % 10) * 0.1, (51 // 10) * 0.1), color='red', fontsize=10, xycoords='axes fraction')
     ax.annotate('B', xy=((63 % 10) * 0.1, (63 // 10) * 0.1), color='red', fontsize=10, xycoords='axes fraction')
