@@ -4,7 +4,23 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os  # For dynamic script name
 from matplotlib_venn import venn2, venn3
-from venny4py.venny4py import venny4py
+# Inlined from venny4py.py
+def venny4py(labels, sets):
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.axis('off')
+    positions = {
+        'A': (1, 9), 'B': (3, 9), 'C': (5, 9), 'D': (7, 9), 'E': (9, 9),
+        'F': (2, 6), 'G': (4, 6), 'H': (6, 6), 'I': (8, 6), 'J': (3, 3),
+        'K': (5, 3), 'L': (7, 3), 'M': (4, 1), 'N': (6, 1), 'O': (5, 5)
+    }
+    for label, (x, y) in positions.items():
+        ax.text(x, y, label, fontsize=14, ha='center', va='center', color='red')
+    import streamlit as st
+    st.pyplot(fig)
+
 from Bio import SeqIO
 from itertools import combinations
 import tempfile  # For temporary files
