@@ -5,3 +5,4 @@ pandas
 openpyxl
 seaborn
 upsetplot
+biopython
