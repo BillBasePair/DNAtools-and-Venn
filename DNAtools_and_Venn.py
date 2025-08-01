@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os  # For dynamic script name
 from matplotlib_venn import venn2, venn3
-# Inlined from venny4py.py
+# Inlined venny4py for 4-set Venn diagram (rendered as HTML download)
 def venny4py(labels, sets):
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -79,7 +79,7 @@ def create_venn_html(sets, keys):
     # Create the data-dependent Venn diagram
     fig = plt.figure(figsize=(8, 8))
     plt.clf()
-    venny4py(labels=keys, sets=sets)
+    venny4py(sets=sets)
     ax = plt.gca()
     ax.annotate('A', xy=((51 % 10) * 0.1, (51 // 10) * 0.1), color='red', fontsize=10, xycoords='axes fraction')
     ax.annotate('B', xy=((63 % 10) * 0.1, (63 // 10) * 0.1), color='red', fontsize=10, xycoords='axes fraction')
