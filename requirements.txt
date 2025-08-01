@@ -1,0 +1,7 @@
+streamlit
+matplotlib
+matplotlib-venn
+pandas
+openpyxl
+seaborn
+upsetplot
