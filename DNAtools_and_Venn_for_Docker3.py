@@ -304,7 +304,7 @@ with tab4:
             st.markdown("**Legend for selecting intersections - RED LETTERS - from 4-diagrams. Numbers are from an arbitrary example.**")
             legend_path = os.path.join(os.path.dirname(__file__), '4way_venn_legend.png')
             if os.path.exists(legend_path):
-                st.image(legend_path, use_container_width=True)
+                st.image(legend_path, width=300)
         # ----- END 4-WAY LEGEND IN SIDEBAR -----
 
     if venn_files and 2 <= len(venn_files) <= 4:
