@@ -10,6 +10,8 @@ from itertools import combinations
 import tempfile  # For temporary files
 import base64  # For embedding images in HTML
 from Bio.SeqUtils import MeltingTemp as mt  # For melting temperature calculation
+import io
+from datetime import datetime
 
 # Function to complement a sequence (5' to 3' direction)
 def complement(seq):
@@ -112,7 +114,7 @@ if password != PASSWORD:
 # ----- END Password Gate -----
 
 st.title("🧬 DNA String Tools")
-tab1, tab2, tab3, tab4 = st.tabs(["🔍 Sequence Finder", "🔁 Reverse Complement", "🌡️ Melting Temp Calculator", "🔗 Venn Diagrams"])
+tab1, tab2, tab3, tab4, tab_st = st.tabs(["🔍 Sequence Finder", "🔁 Reverse Complement", "🌡️ Melting Temp Calculator", "🔗 Venn Diagrams", "🗺️ Stormtrooper ↔ Sequence Mapper"])
 
 # Tab 1: Sequence Finder
 with tab1:
@@ -304,7 +306,7 @@ with tab4:
             st.markdown("**Legend for selecting intersections - RED LETTERS - from 4-diagrams. Numbers are from an arbitrary example.**")
             legend_path = os.path.join(os.path.dirname(__file__), '4way_venn_legend.png')
             if os.path.exists(legend_path):
-                st.image(legend_path, width=300)
+                st.image(legend_path, use_container_width=True)
         # ----- END 4-WAY LEGEND IN SIDEBAR -----
 
     if venn_files and 2 <= len(venn_files) <= 4:
@@ -591,3 +593,158 @@ with tab4:
     else:
         if venn_files and (len(venn_files) < 2 or len(venn_files) > 4):
             st.warning("Please upload 2 to 4 files for Venn diagram analysis.")
+
+# Tab Stormtrooper Mapper
+with tab_st:
+    st.header("Stormtrooper ↔ Sequence Mapper")
+    st.markdown("**v18** – map Stormtrooper Tags ↔ DNA sequences (or vice-versa) with optional extra columns.")
+
+    colA, colB = st.columns(2)
+    with colA:
+        query_file = st.file_uploader("Query file (tags OR sequences)", type=["xlsx", "csv", "txt"], key="st_query")
+    with colB:
+        iso_file = st.file_uploader("ISO / Array design file", type=["xlsx", "csv", "txt"], key="st_iso")
+
+    if query_file and iso_file:
+        # ---------- Helper to get sheets ----------
+        def get_sheets(f):
+            if f.name.lower().endswith('.csv'):
+                return ["Sheet1"]
+            try:
+                return pd.ExcelFile(f).sheet_names
+            except:
+                return ["Sheet1"]
+
+        q_sheet = st.selectbox("Query sheet", get_sheets(query_file), key="qsheet")
+        i_sheet = st.selectbox("ISO sheet", get_sheets(iso_file),
+                               index=get_sheets(iso_file).index("Sequence List") if "Sequence List" in get_sheets(iso_file) else 0,
+                               key="isheet")
+
+        # ---------- Load data ----------
+        if query_file.name.lower().endswith('.csv'):
+            query_df = pd.read_csv(query_file)
+        else:
+            query_df = pd.read_excel(query_file, sheet_name=q_sheet)
+
+        if iso_file.name.lower().endswith('.csv'):
+            iso_df = pd.read_csv(iso_file)
+        else:
+            iso_df = pd.read_excel(iso_file, sheet_name=i_sheet)
+
+        st.subheader("Preview – Query file (first 5 rows)")
+        st.dataframe(query_df.head(5), use_container_width=True)
+        st.subheader("Preview – ISO file (first 5 rows)")
+        st.dataframe(iso_df.head(5), use_container_width=True)
+
+        # ---------- Direction ----------
+        direction = st.radio(
+            "What do you want to map?",
+            ("DNA Sequences → I want the Stormtrooper Tag",
+             "Stormtrooper Tags → I want the DNA Sequence"),
+            horizontal=True
+        )
+
+        # ---------- Column selectors ----------
+        iso_tag_col = st.selectbox(
+            "Column with Stormtrooper Tag in ISO file",
+            iso_df.columns,
+            index=iso_df.columns.get_loc("Reporter Name") if "Reporter Name" in iso_df.columns else
+                  iso_df.columns.get_loc("Tag") if "Tag" in iso_df.columns else 0
+        )
+        iso_seq_col = st.selectbox(
+            "Column with DNA Sequence in ISO file",
+            iso_df.columns,
+            index=iso_df.columns.get_loc("Target Seq (5' to 3')") if "Target Seq (5' to 3')" in iso_df.columns else
+                  iso_df.columns.get_loc("Seq") if "Seq" in iso_df.columns else 0
+        )
+
+        extra_cols = st.multiselect("Also return these extra columns from ISO file", iso_df.columns, default=[])
+
+        # ---------- Which column(s) in query file ----------
+        if direction.startswith("DNA Sequences"):
+            default_guess = [c for c in query_df.columns if any(k in str(c).lower() for k in ["seq", "5'", "target"])]
+            q_cols = st.multiselect("Column(s) containing DNA sequences in query file", query_df.columns, default=default_guess)
+            lookup_col, result_col = iso_seq_col, iso_tag_col
+            result_name = "Tag"
+        else:
+            default_guess = [c for c in query_df.columns if any(k in str(c).lower() for k in ["tag", "reporter", "id", "mutant"])]
+            q_cols = st.multiselect("Column(s) containing Stormtrooper Tags in query file", query_df.columns, default=default_guess)
+            lookup_col, result_col = iso_tag_col, iso_seq_col
+            result_name = "Sequence"
+
+        # ---------- Options ----------
+        col1, col2 = st.columns(2)
+        with col1:
+            simple_output = st.checkbox("Simple output (Input + Result only)", value=True)
+        with col2:
+            show_only_matches = st.checkbox("Show only successful matches (remove NOT FOUND)", value=False)
+
+        if st.button("Run Mapping", type="primary"):
+            if not q_cols:
+                st.error("Please select at least one query column.")
+                st.stop()
+
+            # ---------- Build lookup dictionary ----------
+            lookup = {}
+            for _, row in iso_df.iterrows():
+                key = str(row[lookup_col]).strip().upper().replace("*", "")
+                if key and key != "NAN":
+                    entry = {result_col: str(row[result_col]).strip()}
+                    for c in extra_cols:
+                        entry[c] = row[c]
+                    lookup[key] = entry
+
+            # ---------- Perform mapping ----------
+            all_results = []
+            for col in q_cols:
+                raw_vals = query_df[col].astype(str)
+                clean_vals = raw_vals.str.strip().str.upper().str.replace("*", "", regex=False)
+
+                for raw, clean in zip(raw_vals, clean_vals):
+                    if pd.notna(raw) and raw.strip():
+                        match = lookup.get(clean)
+                        if match:
+                            row_out = {"Input": raw, result_name: match[result_col]}
+                            for c in extra_cols:
+                                row_out[c] = match.get(c, "")
+                            all_results.append(row_out)
+                        else:
+                            all_results.append({"Input": raw, result_name: "NOT FOUND"})
+
+            result_df = pd.DataFrame(all_results)
+
+            # Apply filters
+            if simple_output:
+                result_df = result_df[["Input", result_name]]
+            if show_only_matches:
+                result_df = result_df[result_df[result_name] != "NOT FOUND"]
+
+            # ---------- Display ----------
+            st.success(f"Mapping complete – {len(result_df)} rows generated")
+            st.dataframe(result_df, use_container_width=True)
+
+            # Nice monospaced sequences if they are present
+            if "Sequence" in result_df.columns:
+                html = result_df[["Sequence"]].to_html(index=False, escape=False)
+                html = html.replace("<td>", "<td style='font-family: Courier New; font-size: 13px;'>")
+                st.markdown(html, unsafe_allow_html=True)
+
+            # Stats
+            found = len(result_df[result_df[result_name] != "NOT FOUND"]) if not show_only_matches else len(result_df)
+            total = len(all_results)
+            st.write(f"**{found} / {total}** items matched (before filtering)")
+
+            # ---------- Download ----------
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                result_df.to_excel(writer, index=False, sheet_name="Mapping_Result")
+            output.seek(0)
+
+            st.download_button(
+                label="Download result as Excel",
+                data=output,
+                file_name=f"Stormtrooper_Mapping_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    else:
+        st.info("↑ Upload both a **query** file and an **ISO/array design** file to start mapping.")
