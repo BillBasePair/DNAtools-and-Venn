@@ -159,28 +159,38 @@ def create_upset_figure(sets, keys, intersections):
     # Extra bottom margin so the letter row fits under the dot matrix
     fig = plt.figure(figsize=(14, 7))
     fig.subplots_adjust(bottom=0.18)
-    upset = UpSet(data, subset_size="count", show_counts=True, sort_by="cardinality")
+    # Use explicit facecolor/edgecolor to avoid RGBA issues in newer matplotlib
+    upset = UpSet(data, subset_size="count", show_counts=True, sort_by="cardinality",
+                  facecolor="#333333", with_lines=True, element_size=None)
     axes_dict = upset.plot(fig)
     plt.suptitle(f"{n}-Set Overlap (UpSet Plot) — red letters match dropdown",
                  fontsize=12, y=1.02)
 
-    # ── Place letter labels in bar_ax using axes coordinates (version-safe) ──
-    bar_ax = axes_dict.get("intersections")
+    # ── Place letter labels in the dot-matrix axis, one row below the lowest dots ──
+    # "matrix" axis holds the dot grid; we annotate along its x positions.
+    matrix_ax = axes_dict.get("matrix")
+    bar_ax    = axes_dict.get("intersections")
 
-    if bar_ax is not None:
+    if bar_ax is not None and matrix_ax is not None:
+        # Derive the sorted column order from the data index (same sort as UpSet)
         counts = data.groupby(level=list(range(n))).size().sort_values(ascending=False)
+
+        # Get x-centre of each bar from the bar axis
         bars = bar_ax.patches
-        ylim = bar_ax.get_ylim()
-        y_pos = ylim[0] - (ylim[1] - ylim[0]) * 0.12  # just below x-axis in data coords
-        bar_ax.set_ylim(ylim[0] - (ylim[1] - ylim[0]) * 0.18, ylim[1])
         for bar, (idx_tuple, _) in zip(bars, counts.items()):
             member_indices = frozenset(i for i, v in enumerate(idx_tuple) if v)
             letter = label_map.get(member_indices, "?")
-            x = bar.get_x() + bar.get_width() / 2
-            bar_ax.text(x, y_pos, letter,
-                        ha="center", va="top",
-                        fontsize=10, fontweight="bold", color="red",
-                        clip_on=False)
+            # x in bar_ax coordinates
+            x_bar = bar.get_x() + bar.get_width() / 2
+            # Convert to matrix_ax coordinates (same figure, x-axes are aligned)
+            # Place letter just below the bottom of the matrix axis (y < 0 in axes coords)
+            matrix_ax.text(
+                x_bar, -0.7, letter,
+                ha="center", va="top",
+                fontsize=10, fontweight="bold", color="red",
+                transform=matrix_ax.get_xaxis_transform(),
+                clip_on=False
+            )
 
     return fig
 
