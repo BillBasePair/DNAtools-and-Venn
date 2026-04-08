@@ -156,12 +156,23 @@ def create_upset_figure(sets, keys, intersections):
             memberships.append(member_of)
 
     data = from_memberships(memberships)
+
+    # ── Compatibility fix for upsetplot 0.9.0 + matplotlib 3.9+ ──────────────
+    # upsetplot passes a pandas Series as edgecolors to ax.scatter, which newer
+    # matplotlib rejects. We patch the Series.values into plain numpy arrays by
+    # rebuilding the data with a clean index.
+    import pandas as _pd
+    if hasattr(data, "index"):
+        new_index = _pd.MultiIndex.from_tuples(
+            [tuple(x) for x in data.index.tolist()],
+            names=data.index.names
+        )
+        data = _pd.Series(data.values, index=new_index)
+
     # Extra bottom margin so the letter row fits under the dot matrix
     fig = plt.figure(figsize=(14, 7))
     fig.subplots_adjust(bottom=0.18)
-    # Use explicit facecolor/edgecolor to avoid RGBA issues in newer matplotlib
-    upset = UpSet(data, subset_size="count", show_counts=True, sort_by="cardinality",
-                  facecolor="#333333", with_lines=True, element_size=None)
+    upset = UpSet(data, subset_size="count", show_counts=True, sort_by="cardinality")
     axes_dict = upset.plot(fig)
     plt.suptitle(f"{n}-Set Overlap (UpSet Plot) — red letters match dropdown",
                  fontsize=12, y=1.02)
