@@ -7,3 +7,4 @@ biopython
 upsetplot==0.9.0
 venn>=0.1.3
 openpyxl
+viennarna==2.7.2
