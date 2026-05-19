@@ -160,7 +160,27 @@ def create_upset_figure(sets, keys, intersections):
     fig = plt.figure(figsize=(14, 7))
     fig.subplots_adjust(bottom=0.18)
     upset = UpSet(data, subset_size="count", show_counts=True, sort_by="cardinality")
+
+    # ── Patch ax.scatter to sanitize edgecolors before upsetplot passes them ──
+    # upsetplot 0.9.0 passes pandas Series as edgecolors; matplotlib 3.9+ rejects this.
+    import matplotlib.axes._axes as _mpl_axes
+    import numpy as _np
+    import pandas as _pd
+    _orig_scatter = _mpl_axes.Axes.scatter
+    def _patched_scatter(self, *args, **kwargs):
+        if "edgecolors" in kwargs:
+            ec = kwargs["edgecolors"]
+            if isinstance(ec, (_pd.Series, _pd.Index)):
+                kwargs["edgecolors"] = ec.tolist()
+            elif hasattr(ec, "values"):
+                kwargs["edgecolors"] = list(ec)
+        return _orig_scatter(self, *args, **kwargs)
+    _mpl_axes.Axes.scatter = _patched_scatter
+
     axes_dict = upset.plot(fig)
+
+    # Restore original scatter after plot
+    _mpl_axes.Axes.scatter = _orig_scatter
     plt.suptitle(f"{n}-Set Overlap (UpSet Plot) — red letters match dropdown",
                  fontsize=12, y=1.02)
 
