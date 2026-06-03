@@ -170,26 +170,48 @@ def create_upset_figure(sets, keys, intersections):
     fig.subplots_adjust(bottom=0.18)
     upset = UpSet(data, subset_size="count", show_counts=True, sort_by="cardinality")
 
-    # ── Patch ax.scatter to sanitize edgecolors before upsetplot passes them ──
-    # upsetplot 0.9.0 passes pandas Series as edgecolors; matplotlib 3.9+ rejects this.
+    # ── Patch ax.scatter to sanitize kwargs before upsetplot passes them ──
+    # upsetplot passes pandas Series or NaN-filled lists for several kwargs;
+    # matplotlib 3.9+ rejects both. We convert Series/Index to lists, then
+    # replace any NaN values with safe per-kwarg defaults.
     import matplotlib.axes._axes as _mpl_axes
     import numpy as _np
     import pandas as _pd
+    import math as _math
+
+    _KWARG_DEFAULTS = {
+        "linestyles": "solid",
+        "edgecolors": "face",
+        "linewidths": 1.0,
+        "facecolors": "none",
+        "alpha": 1.0,
+        "zorder": 1,
+    }
+
+    def _is_nan(v):
+        try:
+            return _math.isnan(v)
+        except (TypeError, ValueError):
+            return False
+
     _orig_scatter = _mpl_axes.Axes.scatter
     def _patched_scatter(self, *args, **kwargs):
-        # upsetplot passes pandas Series for several kwargs; matplotlib 3.9+ rejects them.
-        # Sanitize any kwarg that is a Series, Index, or array-like with a .values attribute.
-        _series_kwargs = [
-            "edgecolors", "linestyles", "linewidths", "facecolors",
-            "c", "colors", "sizes", "zorder", "alpha",
-        ]
-        for _kw in _series_kwargs:
-            if _kw in kwargs:
-                _val = kwargs[_kw]
-                if isinstance(_val, (_pd.Series, _pd.Index)):
-                    kwargs[_kw] = _val.tolist()
-                elif hasattr(_val, "values") and not isinstance(_val, (_np.ndarray,)):
-                    kwargs[_kw] = list(_val)
+        for _kw, _default in _KWARG_DEFAULTS.items():
+            if _kw not in kwargs:
+                continue
+            _val = kwargs[_kw]
+            # Convert Series / Index / other pandas objects to plain list
+            if isinstance(_val, (_pd.Series, _pd.Index)):
+                _val = _val.tolist()
+            elif hasattr(_val, "values") and not isinstance(_val, _np.ndarray):
+                _val = list(_val)
+            # Replace any NaN elements with the safe default
+            if isinstance(_val, list):
+                _val = [_default if _is_nan(v) else v for v in _val]
+            elif isinstance(_val, _np.ndarray):
+                # numpy array of objects (e.g. object dtype with NaNs)
+                _val = [_default if _is_nan(v) else v for v in _val.tolist()]
+            kwargs[_kw] = _val
         return _orig_scatter(self, *args, **kwargs)
     _mpl_axes.Axes.scatter = _patched_scatter
 
