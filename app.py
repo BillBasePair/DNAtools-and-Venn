@@ -177,12 +177,19 @@ def create_upset_figure(sets, keys, intersections):
     import pandas as _pd
     _orig_scatter = _mpl_axes.Axes.scatter
     def _patched_scatter(self, *args, **kwargs):
-        if "edgecolors" in kwargs:
-            ec = kwargs["edgecolors"]
-            if isinstance(ec, (_pd.Series, _pd.Index)):
-                kwargs["edgecolors"] = ec.tolist()
-            elif hasattr(ec, "values"):
-                kwargs["edgecolors"] = list(ec)
+        # upsetplot passes pandas Series for several kwargs; matplotlib 3.9+ rejects them.
+        # Sanitize any kwarg that is a Series, Index, or array-like with a .values attribute.
+        _series_kwargs = [
+            "edgecolors", "linestyles", "linewidths", "facecolors",
+            "c", "colors", "sizes", "zorder", "alpha",
+        ]
+        for _kw in _series_kwargs:
+            if _kw in kwargs:
+                _val = kwargs[_kw]
+                if isinstance(_val, (_pd.Series, _pd.Index)):
+                    kwargs[_kw] = _val.tolist()
+                elif hasattr(_val, "values") and not isinstance(_val, (_np.ndarray,)):
+                    kwargs[_kw] = list(_val)
         return _orig_scatter(self, *args, **kwargs)
     _mpl_axes.Axes.scatter = _patched_scatter
 
