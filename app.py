@@ -170,65 +170,104 @@ def create_upset_figure(sets, keys, intersections):
     fig.subplots_adjust(bottom=0.18)
     upset = UpSet(data, subset_size="count", show_counts=True, sort_by="cardinality")
 
-    # ── Patch ax.scatter to sanitize kwargs before upsetplot passes them ──
-    # upsetplot 0.9+ passes pandas Series, NaN-filled lists, and numpy scalar
-    # strings (np.str_) for several kwargs; matplotlib 3.9+ rejects all of these.
-    # Instead of patching kwarg-by-kwarg, we deep-convert every kwarg value to
-    # plain Python primitives before forwarding to matplotlib.
-    import matplotlib.axes._axes as _mpl_axes
+    # ── Patch upsetplot.plotting.UpSet.plot_matrix to fix pandas CoW breakage ──
+    # In pandas 2.0+ (Copy-on-Write), upsetplot's inplace fillna() calls on
+    # DataFrame column slices silently do nothing, leaving NaN values in the
+    # styles columns. These NaNs then reach matplotlib 3.9+ which rejects them.
+    # We replace plot_matrix with an identical copy that uses CoW-safe assignment.
+    import upsetplot.plotting as _upsetplot_plotting
     import numpy as _np
     import pandas as _pd
-    import math as _math
 
-    _KWARG_DEFAULTS = {
-        "linestyles": "solid",
-        "edgecolors": "face",
-        "linewidths": 1.0,
-        "facecolors": "none",
-        "alpha": 1.0,
-        "zorder": 1,
-    }
+    def _patched_plot_matrix(self, ax):
+        ax = self._reorient(ax)
+        data = self.intersections
+        n_cats = data.index.nlevels
+        inclusion = data.index.to_frame().values
 
-    def _is_nan(v):
-        try:
-            return _math.isnan(v)
-        except (TypeError, ValueError):
-            return False
+        styles = [
+            [
+                self.subset_styles[i]
+                if inclusion[i, j]
+                else {"facecolor": self._other_dots_color, "linewidth": 0}
+                for j in range(n_cats)
+            ]
+            for i in range(len(data))
+        ]
+        styles = sum(styles, [])
+        style_columns = {
+            "facecolor": "facecolors",
+            "edgecolor": "edgecolors",
+            "linewidth": "linewidths",
+            "linestyle": "linestyles",
+            "hatch": "hatch",
+        }
+        styles = (
+            _pd.DataFrame(styles)
+            .reindex(columns=style_columns.keys())
+            .astype({"facecolor": "O", "edgecolor": "O",
+                     "linewidth": float, "linestyle": "O", "hatch": "O"})
+        )
+        # CoW-safe fillna (replaces broken inplace=True calls)
+        styles["linewidth"] = styles["linewidth"].fillna(1)
+        styles["facecolor"] = styles["facecolor"].fillna(self._facecolor)
+        styles["edgecolor"] = styles["edgecolor"].fillna(styles["facecolor"])
+        styles["linestyle"] = styles["linestyle"].fillna("solid")
+        del styles["hatch"]
 
-    def _sanitize(val, default):
-        """Convert val to plain Python primitives matplotlib 3.9+ will accept."""
-        # 1. pandas -> list
-        if isinstance(val, (_pd.Series, _pd.Index)):
-            val = val.tolist()
-        elif hasattr(val, "values") and not isinstance(val, _np.ndarray):
-            val = list(val)
-        # 2. numpy array -> list
-        if isinstance(val, _np.ndarray):
-            val = val.tolist()
-        # 3. process list element-by-element
-        if isinstance(val, list):
-            out = []
-            for v in val:
-                # unwrap numpy scalars to Python native (np.str_ -> str, etc.)
-                if isinstance(v, _np.generic):
-                    v = v.item()
-                # replace NaN with safe default
-                if _is_nan(v):
-                    v = default
-                out.append(v)
-            return out
-        # 4. single numpy scalar
-        if isinstance(val, _np.generic):
-            val = val.item()
-        return val
+        x = _np.repeat(_np.arange(len(data)), n_cats)
+        y = _np.tile(_np.arange(n_cats), len(data))
 
-    _orig_scatter = _mpl_axes.Axes.scatter
-    def _patched_scatter(self, *args, **kwargs):
-        for _kw, _default in _KWARG_DEFAULTS.items():
-            if _kw in kwargs:
-                kwargs[_kw] = _sanitize(kwargs[_kw], _default)
-        return _orig_scatter(self, *args, **kwargs)
-    _mpl_axes.Axes.scatter = _patched_scatter
+        if self._element_size is not None:
+            s = (self._element_size * 0.35) ** 2
+        else:
+            s = 200
+
+        # Convert each column to a plain Python list so matplotlib accepts it
+        scatter_kwargs = {
+            style_columns[col]: styles[col].tolist()
+            for col in styles.columns
+        }
+        ax.scatter(*self._swapaxes(x, y), s=s, zorder=10, **scatter_kwargs)
+
+        if self._with_lines:
+            idx = _np.flatnonzero(inclusion)
+            line_data = (
+                _pd.Series(y[idx], index=x[idx])
+                .groupby(level=0)
+                .aggregate(["min", "max"])
+            )
+            colors = _pd.Series(
+                [
+                    style.get("edgecolor", style.get("facecolor", self._facecolor))
+                    for style in self.subset_styles
+                ],
+                name="color",
+            )
+            line_data = line_data.join(colors)
+            ax.vlines(
+                line_data.index.values,
+                line_data["min"],
+                line_data["max"],
+                lw=2,
+                colors=line_data["color"].tolist(),
+                zorder=5,
+            )
+
+        tick_axis = ax.yaxis
+        tick_axis.set_ticks(_np.arange(n_cats))
+        tick_axis.set_ticklabels(
+            data.index.names, rotation=0 if self._horizontal else -90
+        )
+        ax.xaxis.set_visible(False)
+        ax.tick_params(axis="y", length=0)
+        ax.set_frame_on(False)
+        ax.set_xlim(-0.5, len(data) - 0.5)
+        ax.set_ylim(-0.5, n_cats - 0.5)
+        if not self._horizontal:
+            ax.invert_yaxis()
+
+    _upsetplot_plotting.UpSet.plot_matrix = _patched_plot_matrix
 
     axes_dict = upset.plot(fig)
 
