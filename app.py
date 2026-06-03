@@ -165,16 +165,16 @@ def create_upset_figure(sets, keys, intersections):
             memberships.append(member_of)
 
     data = from_memberships(memberships)
-    # Extra bottom margin so the letter row fits under the dot matrix
     fig = plt.figure(figsize=(14, 7))
     fig.subplots_adjust(bottom=0.18)
     upset = UpSet(data, subset_size="count", show_counts=True, sort_by="cardinality")
 
-    # ── Patch upsetplot.plotting.UpSet.plot_matrix to fix pandas CoW breakage ──
-    # In pandas 2.0+ (Copy-on-Write), upsetplot's inplace fillna() calls on
-    # DataFrame column slices silently do nothing, leaving NaN values in the
-    # styles columns. These NaNs then reach matplotlib 3.9+ which rejects them.
-    # We replace plot_matrix with an identical copy that uses CoW-safe assignment.
+    # ── Patch 1: plot_matrix ──────────────────────────────────────────────────
+    # Two bugs in upsetplot vs modern pandas/matplotlib:
+    # (a) pandas 2.0 Copy-on-Write makes inplace fillna() a silent no-op on
+    #     column slices, leaving NaN in edgecolors/linestyles → matplotlib rejects.
+    # (b) styles columns are pandas Series; matplotlib 3.9+ rejects them directly.
+    # Fix: rewrite plot_matrix with CoW-safe assignment and explicit .tolist().
     import upsetplot.plotting as _upsetplot_plotting
     import numpy as _np
     import pandas as _pd
@@ -184,23 +184,15 @@ def create_upset_figure(sets, keys, intersections):
         data = self.intersections
         n_cats = data.index.nlevels
         inclusion = data.index.to_frame().values
-
-        styles = [
-            [
-                self.subset_styles[i]
-                if inclusion[i, j]
-                else {"facecolor": self._other_dots_color, "linewidth": 0}
-                for j in range(n_cats)
-            ]
-            for i in range(len(data))
-        ]
-        styles = sum(styles, [])
+        styles = sum(
+            [[self.subset_styles[i] if inclusion[i, j]
+              else {"facecolor": self._other_dots_color, "linewidth": 0}
+              for j in range(n_cats)]
+             for i in range(len(data))], []
+        )
         style_columns = {
-            "facecolor": "facecolors",
-            "edgecolor": "edgecolors",
-            "linewidth": "linewidths",
-            "linestyle": "linestyles",
-            "hatch": "hatch",
+            "facecolor": "facecolors", "edgecolor": "edgecolors",
+            "linewidth": "linewidths", "linestyle": "linestyles", "hatch": "hatch",
         }
         styles = (
             _pd.DataFrame(styles)
@@ -208,57 +200,32 @@ def create_upset_figure(sets, keys, intersections):
             .astype({"facecolor": "O", "edgecolor": "O",
                      "linewidth": float, "linestyle": "O", "hatch": "O"})
         )
-        # CoW-safe fillna (replaces broken inplace=True calls)
+        # CoW-safe fillna (inplace=True silently fails in pandas 2.0+)
         styles["linewidth"] = styles["linewidth"].fillna(1)
         styles["facecolor"] = styles["facecolor"].fillna(self._facecolor)
         styles["edgecolor"] = styles["edgecolor"].fillna(styles["facecolor"])
         styles["linestyle"] = styles["linestyle"].fillna("solid")
         del styles["hatch"]
-
         x = _np.repeat(_np.arange(len(data)), n_cats)
         y = _np.tile(_np.arange(n_cats), len(data))
-
-        if self._element_size is not None:
-            s = (self._element_size * 0.35) ** 2
-        else:
-            s = 200
-
-        # Convert each column to a plain Python list so matplotlib accepts it
-        scatter_kwargs = {
-            style_columns[col]: styles[col].tolist()
-            for col in styles.columns
-        }
-        ax.scatter(*self._swapaxes(x, y), s=s, zorder=10, **scatter_kwargs)
-
+        # .tolist() ensures plain Python types — matplotlib 3.9+ rejects Series/numpy scalars
+        scatter_kwargs = {style_columns[col]: styles[col].tolist() for col in styles.columns}
+        ax.scatter(*self._swapaxes(x, y), s=200, zorder=10, **scatter_kwargs)
         if self._with_lines:
             idx = _np.flatnonzero(inclusion)
             line_data = (
                 _pd.Series(y[idx], index=x[idx])
-                .groupby(level=0)
-                .aggregate(["min", "max"])
+                .groupby(level=0).aggregate(["min", "max"])
             )
             colors = _pd.Series(
-                [
-                    style.get("edgecolor", style.get("facecolor", self._facecolor))
-                    for style in self.subset_styles
-                ],
-                name="color",
+                [style.get("edgecolor", style.get("facecolor", self._facecolor))
+                 for style in self.subset_styles], name="color",
             )
             line_data = line_data.join(colors)
-            ax.vlines(
-                line_data.index.values,
-                line_data["min"],
-                line_data["max"],
-                lw=2,
-                colors=line_data["color"].tolist(),
-                zorder=5,
-            )
-
-        tick_axis = ax.yaxis
-        tick_axis.set_ticks(_np.arange(n_cats))
-        tick_axis.set_ticklabels(
-            data.index.names, rotation=0 if self._horizontal else -90
-        )
+            ax.vlines(line_data.index.values, line_data["min"], line_data["max"],
+                      lw=2, colors=line_data["color"].tolist(), zorder=5)
+        ax.yaxis.set_ticks(_np.arange(n_cats))
+        ax.yaxis.set_ticklabels(data.index.names, rotation=0 if self._horizontal else -90)
         ax.xaxis.set_visible(False)
         ax.tick_params(axis="y", length=0)
         ax.set_frame_on(False)
@@ -267,35 +234,62 @@ def create_upset_figure(sets, keys, intersections):
         if not self._horizontal:
             ax.invert_yaxis()
 
+    # ── Patch 2: _label_sizes ─────────────────────────────────────────────────
+    # np.diff(ax.get_xlim()) returns a 1-element array; adding it to a float
+    # produces an array, which matplotlib 3.10 can't convert to scalar in text().
+    # Fix: index with [0] and cast to float() everywhere.
+    def _patched_label_sizes(self, ax, rects, where):
+        if not self._show_counts and not self._show_percentages:
+            return
+        count_fmt = "{:.0f}" if self._show_counts is True else (
+            self._show_counts if isinstance(self._show_counts, str) else None)
+        pct_fmt = "{:.1%}" if self._show_percentages is True else (
+            self._show_percentages if isinstance(self._show_percentages, str) else None)
+        if count_fmt and pct_fmt:
+            fmt = f"{count_fmt}\n({pct_fmt})" if where == "top" else f"{count_fmt} ({pct_fmt})"
+            make_args = lambda val: (val, val / self.total)
+        elif count_fmt:
+            fmt = count_fmt
+            make_args = lambda val: (val,)
+        else:
+            fmt = pct_fmt
+            make_args = lambda val: (val / self.total,)
+        if where in ("right", "left"):
+            margin = float(0.01 * abs(_np.diff(ax.get_xlim())[0]))
+            ha = "left" if where == "right" else "right"
+            for rect in rects:
+                width = float(rect.get_width()) + float(rect.get_x())
+                ax.text(width + margin, float(rect.get_y()) + float(rect.get_height()) * 0.5,
+                        fmt.format(*make_args(width)), ha=ha, va="center")
+        elif where == "top":
+            margin = float(0.01 * abs(_np.diff(ax.get_ylim())[0]))
+            for rect in rects:
+                height = float(rect.get_height()) + float(rect.get_y())
+                ax.text(float(rect.get_x()) + float(rect.get_width()) * 0.5,
+                        height + margin,
+                        fmt.format(*make_args(height)), ha="center", va="bottom")
+
     _upsetplot_plotting.UpSet.plot_matrix = _patched_plot_matrix
+    _upsetplot_plotting.UpSet._label_sizes = _patched_label_sizes
 
     axes_dict = upset.plot(fig)
 
-    # Restore original scatter after plot
-    _mpl_axes.Axes.scatter = _orig_scatter
     plt.suptitle(f"{n}-Set Overlap (UpSet Plot) — red letters match dropdown",
                  fontsize=12, y=1.02)
 
-    # ── Place letter labels in the dot-matrix axis, one row below the lowest dots ──
-    # "matrix" axis holds the dot grid; we annotate along its x positions.
+    # ── Place letter labels below the dot matrix ──────────────────────────────
     matrix_ax = axes_dict.get("matrix")
     bar_ax    = axes_dict.get("intersections")
 
     if bar_ax is not None and matrix_ax is not None:
-        # Derive the sorted column order from the data index (same sort as UpSet)
         counts = data.groupby(level=list(range(n))).size().sort_values(ascending=False)
-
-        # Get x-centre of each bar from the bar axis
         bars = bar_ax.patches
         for bar, (idx_tuple, _) in zip(bars, counts.items()):
             member_indices = frozenset(i for i, v in enumerate(idx_tuple) if v)
             letter = label_map.get(member_indices, "?")
-            # x in bar_ax coordinates
-            x_bar = bar.get_x() + bar.get_width() / 2
-            # Convert to matrix_ax coordinates (same figure, x-axes are aligned)
-            # Place letter just below the bottom of the matrix axis (y < 0 in axes coords)
+            x_bar = float(bar.get_x()) + float(bar.get_width()) / 2
             matrix_ax.text(
-                x_bar, -0.7, letter,
+                float(x_bar), -0.7, letter,
                 ha="center", va="top",
                 fontsize=10, fontweight="bold", color="red",
                 transform=matrix_ax.get_xaxis_transform(),
@@ -303,6 +297,7 @@ def create_upset_figure(sets, keys, intersections):
             )
 
     return fig
+
 
 
 # Fallback bar chart when upsetplot not installed
