@@ -165,131 +165,54 @@ def create_upset_figure(sets, keys, intersections):
             memberships.append(member_of)
 
     data = from_memberships(memberships)
+    # Extra bottom margin so the letter row fits under the dot matrix
     fig = plt.figure(figsize=(14, 7))
     fig.subplots_adjust(bottom=0.18)
     upset = UpSet(data, subset_size="count", show_counts=True, sort_by="cardinality")
 
-    # ── Patch 1: plot_matrix ──────────────────────────────────────────────────
-    # Two bugs in upsetplot vs modern pandas/matplotlib:
-    # (a) pandas 2.0 Copy-on-Write makes inplace fillna() a silent no-op on
-    #     column slices, leaving NaN in edgecolors/linestyles → matplotlib rejects.
-    # (b) styles columns are pandas Series; matplotlib 3.9+ rejects them directly.
-    # Fix: rewrite plot_matrix with CoW-safe assignment and explicit .tolist().
-    import upsetplot.plotting as _upsetplot_plotting
+    # ── Patch ax.scatter to sanitize edgecolors before upsetplot passes them ──
+    # upsetplot 0.9.0 passes pandas Series as edgecolors; matplotlib 3.9+ rejects this.
+    import matplotlib.axes._axes as _mpl_axes
     import numpy as _np
     import pandas as _pd
-
-    def _patched_plot_matrix(self, ax):
-        ax = self._reorient(ax)
-        data = self.intersections
-        n_cats = data.index.nlevels
-        inclusion = data.index.to_frame().values
-        styles = sum(
-            [[self.subset_styles[i] if inclusion[i, j]
-              else {"facecolor": self._other_dots_color, "linewidth": 0}
-              for j in range(n_cats)]
-             for i in range(len(data))], []
-        )
-        style_columns = {
-            "facecolor": "facecolors", "edgecolor": "edgecolors",
-            "linewidth": "linewidths", "linestyle": "linestyles", "hatch": "hatch",
-        }
-        styles = (
-            _pd.DataFrame(styles)
-            .reindex(columns=style_columns.keys())
-            .astype({"facecolor": "O", "edgecolor": "O",
-                     "linewidth": float, "linestyle": "O", "hatch": "O"})
-        )
-        # CoW-safe fillna (inplace=True silently fails in pandas 2.0+)
-        styles["linewidth"] = styles["linewidth"].fillna(1)
-        styles["facecolor"] = styles["facecolor"].fillna(self._facecolor)
-        styles["edgecolor"] = styles["edgecolor"].fillna(styles["facecolor"])
-        styles["linestyle"] = styles["linestyle"].fillna("solid")
-        del styles["hatch"]
-        x = _np.repeat(_np.arange(len(data)), n_cats)
-        y = _np.tile(_np.arange(n_cats), len(data))
-        # .tolist() ensures plain Python types — matplotlib 3.9+ rejects Series/numpy scalars
-        scatter_kwargs = {style_columns[col]: styles[col].tolist() for col in styles.columns}
-        ax.scatter(*self._swapaxes(x, y), s=200, zorder=10, **scatter_kwargs)
-        if self._with_lines:
-            idx = _np.flatnonzero(inclusion)
-            line_data = (
-                _pd.Series(y[idx], index=x[idx])
-                .groupby(level=0).aggregate(["min", "max"])
-            )
-            colors = _pd.Series(
-                [style.get("edgecolor", style.get("facecolor", self._facecolor))
-                 for style in self.subset_styles], name="color",
-            )
-            line_data = line_data.join(colors)
-            ax.vlines(line_data.index.values, line_data["min"], line_data["max"],
-                      lw=2, colors=line_data["color"].tolist(), zorder=5)
-        ax.yaxis.set_ticks(_np.arange(n_cats))
-        ax.yaxis.set_ticklabels(data.index.names, rotation=0 if self._horizontal else -90)
-        ax.xaxis.set_visible(False)
-        ax.tick_params(axis="y", length=0)
-        ax.set_frame_on(False)
-        ax.set_xlim(-0.5, len(data) - 0.5)
-        ax.set_ylim(-0.5, n_cats - 0.5)
-        if not self._horizontal:
-            ax.invert_yaxis()
-
-    # ── Patch 2: _label_sizes ─────────────────────────────────────────────────
-    # np.diff(ax.get_xlim()) returns a 1-element array; adding it to a float
-    # produces an array, which matplotlib 3.10 can't convert to scalar in text().
-    # Fix: index with [0] and cast to float() everywhere.
-    def _patched_label_sizes(self, ax, rects, where):
-        if not self._show_counts and not self._show_percentages:
-            return
-        count_fmt = "{:.0f}" if self._show_counts is True else (
-            self._show_counts if isinstance(self._show_counts, str) else None)
-        pct_fmt = "{:.1%}" if self._show_percentages is True else (
-            self._show_percentages if isinstance(self._show_percentages, str) else None)
-        if count_fmt and pct_fmt:
-            fmt = f"{count_fmt}\n({pct_fmt})" if where == "top" else f"{count_fmt} ({pct_fmt})"
-            make_args = lambda val: (val, val / self.total)
-        elif count_fmt:
-            fmt = count_fmt
-            make_args = lambda val: (val,)
-        else:
-            fmt = pct_fmt
-            make_args = lambda val: (val / self.total,)
-        if where in ("right", "left"):
-            margin = float(0.01 * abs(_np.diff(ax.get_xlim())[0]))
-            ha = "left" if where == "right" else "right"
-            for rect in rects:
-                width = float(rect.get_width()) + float(rect.get_x())
-                ax.text(width + margin, float(rect.get_y()) + float(rect.get_height()) * 0.5,
-                        fmt.format(*make_args(width)), ha=ha, va="center")
-        elif where == "top":
-            margin = float(0.01 * abs(_np.diff(ax.get_ylim())[0]))
-            for rect in rects:
-                height = float(rect.get_height()) + float(rect.get_y())
-                ax.text(float(rect.get_x()) + float(rect.get_width()) * 0.5,
-                        height + margin,
-                        fmt.format(*make_args(height)), ha="center", va="bottom")
-
-    _upsetplot_plotting.UpSet.plot_matrix = _patched_plot_matrix
-    _upsetplot_plotting.UpSet._label_sizes = _patched_label_sizes
+    _orig_scatter = _mpl_axes.Axes.scatter
+    def _patched_scatter(self, *args, **kwargs):
+        if "edgecolors" in kwargs:
+            ec = kwargs["edgecolors"]
+            if isinstance(ec, (_pd.Series, _pd.Index)):
+                kwargs["edgecolors"] = ec.tolist()
+            elif hasattr(ec, "values"):
+                kwargs["edgecolors"] = list(ec)
+        return _orig_scatter(self, *args, **kwargs)
+    _mpl_axes.Axes.scatter = _patched_scatter
 
     axes_dict = upset.plot(fig)
 
+    # Restore original scatter after plot
+    _mpl_axes.Axes.scatter = _orig_scatter
     plt.suptitle(f"{n}-Set Overlap (UpSet Plot) — red letters match dropdown",
                  fontsize=12, y=1.02)
 
-    # ── Place letter labels below the dot matrix ──────────────────────────────
+    # ── Place letter labels in the dot-matrix axis, one row below the lowest dots ──
+    # "matrix" axis holds the dot grid; we annotate along its x positions.
     matrix_ax = axes_dict.get("matrix")
     bar_ax    = axes_dict.get("intersections")
 
     if bar_ax is not None and matrix_ax is not None:
+        # Derive the sorted column order from the data index (same sort as UpSet)
         counts = data.groupby(level=list(range(n))).size().sort_values(ascending=False)
+
+        # Get x-centre of each bar from the bar axis
         bars = bar_ax.patches
         for bar, (idx_tuple, _) in zip(bars, counts.items()):
             member_indices = frozenset(i for i, v in enumerate(idx_tuple) if v)
             letter = label_map.get(member_indices, "?")
-            x_bar = float(bar.get_x()) + float(bar.get_width()) / 2
+            # x in bar_ax coordinates
+            x_bar = bar.get_x() + bar.get_width() / 2
+            # Convert to matrix_ax coordinates (same figure, x-axes are aligned)
+            # Place letter just below the bottom of the matrix axis (y < 0 in axes coords)
             matrix_ax.text(
-                float(x_bar), -0.7, letter,
+                x_bar, -0.7, letter,
                 ha="center", va="top",
                 fontsize=10, fontweight="bold", color="red",
                 transform=matrix_ax.get_xaxis_transform(),
@@ -297,7 +220,6 @@ def create_upset_figure(sets, keys, intersections):
             )
 
     return fig
-
 
 
 # Fallback bar chart when upsetplot not installed
@@ -326,7 +248,7 @@ def create_pyvenn_figure(sets, keys):
     return fig
 
 # Main Streamlit app
-st.set_page_config(page_title="DNA String Tools", layout="wide")
+st.set_page_config(page_title="DNA String Tools", page_icon="🧬", layout="wide")
 # ----- BEGIN BasePair Secure Password Gate -----
 PASSWORD = "IceNine9&"
 password = st.text_input("Enter password (same as BasePair wifi password):", type="password")
@@ -336,107 +258,371 @@ if password != PASSWORD:
 # ----- END Password Gate -----
 
 st.title("🧬 DNA String Tools")
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 Sequence Finder", "🔁 Reverse Complement", "🌡️ Melting Temp Calculator", "🔗 Venn Diagrams", "🧬 DNA & RNA Folding"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 Seq Search and/or ST Mapping", "🔁 Reverse Complement", "🧬 DNA & RNA Folding", "🌡️ Melting Temp Calculator", "🔗 Venn Diagrams"])
 
-# Tab 1: Sequence Finder
+# Tab 1: Seq Search and/or ST Mapping
 with tab1:
     with st.expander("About This Tab"):
-        st.write("Search for specific DNA/RNA subsequences (min 4 bases) within uploaded files, highlighting all occurrences in the full sequence for easy identification. Use 'Run Search' to compare exact, partial, or fuzzy matches, with results downloadable as CSV.")
+        st.write(
+            "Search for DNA/RNA sequences within one or more reference files, or map between "
+            "paired values such as Stormtrooper tag codes and their corresponding DNA sequences. "
+            "Upload a query file (or paste sequences directly) and one or more reference files, "
+            "then choose your mode: **Find** searches for your query sequences within a reference "
+            "column using exact, partial, or fuzzy matching; **Map** performs a key→value lookup "
+            "returning the paired column entry for each query. Results are displayed inline and "
+            "downloadable as Excel or CSV. Multiple reference files can be searched simultaneously. "
+            "Tip: file previews appear immediately after upload to help you identify the right "
+            "columns before running."
+        )
 
-    st.header("Sequence Finder")
-    query_input_method = st.radio("Input method", ["Upload file", "Paste sequences"])
-    query_seqs = []
+    st.header("Seq Search and/or ST Mapping")
 
-    if query_input_method == "Upload file":
-        file = st.file_uploader("Upload query file", type=["csv", "xlsx", "fastq", "fq", "txt", "fasta"])
-        if file:
-            name = file.name.lower()
-            if name.endswith(("fastq", "fq")):
-                lines = file.read().decode("utf-8").splitlines()
-                n = st.number_input("Max reads", 1000, 1000000, 10000, 1000)
-                query_seqs = extract_fastq_sequences(lines, n)
-            elif name.endswith("csv"):
-                df = pd.read_csv(file)
-                col = st.selectbox("Sequence column", df.columns, index=df.columns.get_loc("Trimmed") if "Trimmed" in df.columns else 0)
-                query_seqs = df[col].dropna().astype(str).str.upper().tolist()
-            elif name.endswith("xlsx"):
-                df = pd.read_excel(file)
-                col = st.selectbox("Sequence column", df.columns, index=df.columns.get_loc("Trimmed") if "Trimmed" in df.columns else 0)
-                query_seqs = df[col].dropna().astype(str).str.upper().tolist()
+    # ── Step 1: Query ──────────────────────────────────────────────────────────
+    st.markdown("### Step 1 — Your Query")
+    t1_input_method = st.radio(
+        "Input method",
+        ["Upload a file", "Paste sequences"],
+        key="t1_input_method",
+        horizontal=True,
+    )
+
+    t1_query_seqs = []   # list of plain strings
+
+    if t1_input_method == "Upload a file":
+        t1_query_file = st.file_uploader(
+            "Upload query file",
+            type=["xlsx", "csv", "fastq", "fq", "fasta", "txt"],
+            key="t1_query_file",
+        )
+        if t1_query_file:
+            t1_qname = t1_query_file.name.lower()
+            if t1_qname.endswith(("fastq", "fq")):
+                t1_lines = t1_query_file.read().decode("utf-8").splitlines()
+                t1_query_seqs = extract_fastq_sequences(t1_lines)
+                st.caption(f"{len(t1_query_seqs):,} sequences loaded from FASTQ")
+            elif t1_qname.endswith(("fasta", "fa")):
+                t1_text = t1_query_file.read().decode("utf-8")
+                t1_query_seqs = [
+                    line.strip().upper()
+                    for line in t1_text.splitlines()
+                    if line.strip() and not line.startswith(">")
+                ]
+                st.caption(f"{len(t1_query_seqs):,} sequences loaded from FASTA")
+            elif t1_qname.endswith("txt"):
+                t1_text = t1_query_file.read().decode("utf-8")
+                t1_query_seqs = [l.strip().upper() for l in t1_text.splitlines() if l.strip()]
+                st.caption(f"{len(t1_query_seqs):,} sequences loaded from TXT")
             else:
-                text = file.read().decode("utf-8")
-                query_seqs = [line.strip().upper() for line in text.splitlines() if line and not line.startswith(">")]
+                # xlsx or csv — sheet selector + column selector + preview
+                if t1_qname.endswith("xlsx"):
+                    t1_q_sheets = pd.ExcelFile(t1_query_file).sheet_names
+                    t1_q_sheet = st.selectbox("Query sheet", t1_q_sheets, key="t1_q_sheet")
+                    t1_query_file.seek(0)
+                    t1_qdf = pd.read_excel(t1_query_file, sheet_name=t1_q_sheet)
+                else:
+                    t1_qdf = pd.read_csv(t1_query_file)
+                st.dataframe(t1_qdf.head(5), use_container_width=True)
+                t1_default_qcols = [
+                    c for c in t1_qdf.columns
+                    if any(k in str(c).lower() for k in ["seq", "5'", "tag", "reporter", "id"])
+                ]
+                t1_q_cols = st.multiselect(
+                    "Column(s) to use as query",
+                    t1_qdf.columns,
+                    default=t1_default_qcols,
+                    key="t1_q_cols",
+                )
+                if t1_q_cols:
+                    for c in t1_q_cols:
+                        t1_query_seqs += t1_qdf[c].dropna().astype(str).str.strip().tolist()
+                    st.caption(f"{len(t1_query_seqs):,} query values loaded")
     else:
-        pasted = st.text_area("Paste sequences")
-        query_seqs = [line.strip().upper() for line in pasted.splitlines() if line.strip()]
-        st.write(f"Debug: Query sequences loaded: {query_seqs}")  # Debug output
+        t1_pasted = st.text_area(
+            "Paste sequences (one per line)",
+            height=150,
+            key="t1_paste",
+        )
+        t1_query_seqs = [l.strip() for l in t1_pasted.splitlines() if l.strip()]
+        if t1_query_seqs:
+            st.caption(f"{len(t1_query_seqs):,} sequences loaded")
 
-    search_files = st.file_uploader("Upload search files", type=["csv", "xlsx", "fastq", "fq"], accept_multiple_files=True)
-    match_type = st.radio("Match type", ["Exact", "Partial", "Fuzzy"])
-    allow_rc = st.checkbox("Match reverse complement", value=True)
-    mismatches = st.slider("Mismatches (fuzzy only)", 1, 5, 1) if match_type == "Fuzzy" else 0
+    # ── Step 2: Reference files ────────────────────────────────────────────────
+    st.markdown("### Step 2 — Reference File(s)")
+    t1_ref_files = st.file_uploader(
+        "Upload one or more reference files",
+        type=["xlsx", "csv"],
+        accept_multiple_files=True,
+        key="t1_ref_files",
+    )
 
-    if st.button("Run Search"):
-        if query_seqs and search_files:
-            results = []
-            for f in search_files:
-                fname = f.name
-                ext = fname.lower().split(".")[-1]
-                if ext in ["csv", "xlsx"]:
-                    df = pd.read_csv(f) if ext == "csv" else pd.read_excel(f)
-                    st.write(f"**{fname} preview:**")
-                    st.dataframe(df.head())
-                    col = st.selectbox(f"Column in {fname}", df.columns, key=f"col_{fname}", index=df.columns.get_loc("Trimmed") if "Trimmed" in df.columns else 0)
-                    id_col = st.selectbox(f"Optional ID column in {fname}", ["(None)"] + list(df.columns), key=f"id_{fname}")
-                    for idx, row in df.iterrows():
-                        val = str(row[col]).strip().upper()
-                        seqs = [val, reverse_complement(val)] if allow_rc else [val]
-                        for q in query_seqs:
-                            for s in seqs:
-                                if match_type == "Exact" and q == s or \
-                                   match_type == "Partial" and q in s or \
-                                   match_type == "Fuzzy" and is_fuzzy_match(q, s, mismatches):
-                                    highlighted = s  # Use full sequence
-                                    start = 0
-                                    while True:
-                                        start = highlighted.find(q, start)
-                                        if start == -1:
-                                            break
-                                        end = start + len(q)
-                                        highlighted = highlighted[:start] + '<span style="color: red">' + q + '</span>' + highlighted[end:]
-                                        start += len('<span style="color: red">' + q + '</span>')  # Move past the highlighted part
-                                    results.append({"Query": q, "Match": s, "Highlighted Match": highlighted, "File": fname, "Row": idx,
-                                                    "ID": row[id_col] if id_col != "(None)" else ""})
-                                    break
-                elif ext in ["fastq", "fq"]:
-                    lines = f.read().decode("utf-8").splitlines()
-                    for i in range(1, len(lines), 4):
-                        val = lines[i].strip().upper()
-                        seqs = [val, reverse_complement(val)] if allow_rc else [val]
-                        for q in query_seqs:
-                            for s in seqs:
-                                if match_type == "Exact" and q == s or \
-                                   match_type == "Partial" and q in s or \
-                                   match_type == "Fuzzy" and is_fuzzy_match(q, s, mismatches):
-                                    highlighted = s  # Use full sequence
-                                    start = 0
-                                    while True:
-                                        start = highlighted.find(q, start)
-                                        if start == -1:
-                                            break
-                                        end = start + len(q)
-                                        highlighted = highlighted[:start] + '<span style="color: red">' + q + '</span>' + highlighted[end:]
-                                        start += len('<span style="color: red">' + q + '</span>')  # Move past the highlighted part
-                                    results.append({"Query": q, "Match": s, "Highlighted Match": highlighted, "File": fname, "Row": i // 4, "ID": ""})
-                                    break
-
-            df_out = pd.DataFrame(results)
-            html = df_out.to_html(index=False, escape=False)  # Render HTML for red text
-            st.markdown(html, unsafe_allow_html=True)
-            if not df_out.empty:
-                st.download_button("Download results", df_out.to_csv(index=False), "matches.csv", "text/csv")
+    # Per-file config: sheet, preview, column selectors
+    t1_ref_configs = []   # list of dicts: {df, label, lookup_col, extra_cols}
+    for i, rf in enumerate(t1_ref_files):
+        st.markdown(f"**Reference file {i+1}: {rf.name}**")
+        rf_name = rf.name.lower()
+        if rf_name.endswith("xlsx"):
+            rf_sheets = pd.ExcelFile(rf).sheet_names
+            default_sheet_idx = (
+                rf_sheets.index("Sequence List") if "Sequence List" in rf_sheets else 0
+            )
+            rf_sheet = st.selectbox(
+                f"Sheet — {rf.name}",
+                rf_sheets,
+                index=default_sheet_idx,
+                key=f"t1_rf_sheet_{i}",
+            )
+            rf.seek(0)
+            rf_df = pd.read_excel(rf, sheet_name=rf_sheet)
         else:
-            st.warning("Please upload query sequences and search files before running the search.")
+            rf_df = pd.read_csv(rf)
+
+        # Immediate preview
+        st.dataframe(rf_df.head(5), use_container_width=True)
+
+        rf_col1, rf_col2 = st.columns(2)
+        with rf_col1:
+            # Smart default: prefer sequence/tag columns
+            def _best_col(df, hints):
+                for h in hints:
+                    for c in df.columns:
+                        if h in str(c).lower():
+                            return list(df.columns).index(c)
+                return 0
+            lookup_idx = _best_col(rf_df, ["seq", "5'", "reporter", "tag", "target"])
+            t1_lookup_col = st.selectbox(
+                f"Search / lookup in this column",
+                rf_df.columns,
+                index=lookup_idx,
+                key=f"t1_lookup_col_{i}",
+            )
+        with rf_col2:
+            t1_extra_cols = st.multiselect(
+                f"Also return these columns (optional)",
+                [c for c in rf_df.columns if c != t1_lookup_col],
+                default=[],
+                key=f"t1_extra_cols_{i}",
+            )
+        t1_ref_configs.append({
+            "df": rf_df,
+            "name": rf.name,
+            "lookup_col": t1_lookup_col,
+            "extra_cols": t1_extra_cols,
+        })
+
+    # ── Step 3: Operation ──────────────────────────────────────────────────────
+    st.markdown("### Step 3 — Operation")
+    t1_mode = st.radio(
+        "What would you like to do?",
+        [
+            "🔍 Find — search for my query within the reference column",
+            "🏷️ Map — look up a paired value for each query (e.g. tag ↔ sequence)",
+        ],
+        key="t1_mode",
+    )
+
+    if t1_mode.startswith("🔍"):
+        # Find mode options
+        t1_col_a, t1_col_b = st.columns(2)
+        with t1_col_a:
+            t1_match_type = st.radio(
+                "Match type",
+                ["Exact", "Partial", "Fuzzy"],
+                key="t1_match_type",
+                horizontal=True,
+            )
+        with t1_col_b:
+            t1_allow_rc = st.checkbox("Match reverse complement", value=True, key="t1_rc")
+        if t1_match_type == "Fuzzy":
+            t1_mismatches = st.slider("Max mismatches (fuzzy)", 1, 5, 1, key="t1_mismatches")
+        else:
+            t1_mismatches = 0
+        t1_map_return_col = None
+        t1_only_matches = False
+    else:
+        # Map mode options
+        t1_match_type = "Exact"
+        t1_allow_rc = False
+        t1_mismatches = 0
+        # Return column selector — shown per reference file
+        st.markdown("**Map settings**")
+        # We collect these per ref file below at run time; show one global note
+        st.caption(
+            "For each reference file, select the column whose value you want returned for each match. "
+            "This is set per file in Step 2 via 'Also return these columns', or use the selector below."
+        )
+        t1_only_matches = st.checkbox(
+            "Show only successful matches (hide NOT FOUND)",
+            value=False,
+            key="t1_only_matches",
+        )
+        # Per-ref map target column
+        for i, cfg in enumerate(t1_ref_configs):
+            cfg["map_col"] = st.selectbox(
+                f"Return value from this column — {cfg['name']}",
+                cfg["df"].columns,
+                index=min(1, len(cfg["df"].columns) - 1),
+                key=f"t1_map_col_{i}",
+            )
+
+    t1_simple = st.checkbox(
+        "Simple output: Input + Result only (no extra columns)",
+        value=True,
+        key="t1_simple",
+    )
+
+    # ── Step 4: Run ───────────────────────────────────────────────────────────
+    st.markdown("### Step 4 — Run")
+    if st.button("▶ Run", key="t1_run", type="primary"):
+        if not t1_query_seqs:
+            st.error("No query sequences loaded. Check Step 1.")
+            st.stop()
+        if not t1_ref_configs:
+            st.error("No reference files uploaded. Check Step 2.")
+            st.stop()
+
+        all_results = []
+
+        if t1_mode.startswith("🔍"):
+            # ── Find mode ──
+            for cfg in t1_ref_configs:
+                rf_df      = cfg["df"]
+                rf_name    = cfg["name"]
+                lookup_col = cfg["lookup_col"]
+                extra_cols = cfg["extra_cols"]
+
+                for idx, row in rf_df.iterrows():
+                    ref_val = str(row[lookup_col]).strip().upper()
+                    ref_vals = [ref_val]
+                    if t1_allow_rc:
+                        ref_vals.append(reverse_complement(ref_val))
+
+                    for q_raw in t1_query_seqs:
+                        q = q_raw.strip().upper()
+                        if not q:
+                            continue
+                        for rv in ref_vals:
+                            matched = False
+                            if t1_match_type == "Exact":
+                                matched = q == rv
+                            elif t1_match_type == "Partial":
+                                matched = q in rv
+                            elif t1_match_type == "Fuzzy":
+                                matched = is_fuzzy_match(q, rv, t1_mismatches)
+                            if matched:
+                                highlighted = highlight_match(rv, q)
+                                result_row = {
+                                    "Query":      q_raw,
+                                    "Match":      rv,
+                                    "Highlighted": highlighted,
+                                    "File":       rf_name,
+                                    "Row":        idx,
+                                }
+                                if not t1_simple:
+                                    for c in extra_cols:
+                                        result_row[c] = row[c]
+                                all_results.append(result_row)
+                                break  # one match per ref row per query
+
+        else:
+            # ── Map mode ──
+            for cfg in t1_ref_configs:
+                rf_df      = cfg["df"]
+                rf_name    = cfg["name"]
+                lookup_col = cfg["lookup_col"]
+                map_col    = cfg.get("map_col", lookup_col)
+                extra_cols = cfg["extra_cols"]
+
+                # Build lookup dict (case-insensitive, strip asterisks)
+                t1_lookup = {}
+                for _, row in rf_df.iterrows():
+                    k = str(row[lookup_col]).strip().upper().replace("*", "")
+                    if k and k != "NAN" and k not in t1_lookup:
+                        entry = {"_result": str(row[map_col]).strip()}
+                        for c in extra_cols:
+                            entry[c] = row[c]
+                        t1_lookup[k] = entry
+
+                for q_raw in t1_query_seqs:
+                    q_clean = q_raw.strip().upper().replace("*", "")
+                    if not q_clean or q_clean == "NAN":
+                        continue
+                    match = t1_lookup.get(q_clean)
+                    if match:
+                        result_row = {
+                            "Input":  q_raw,
+                            "Result": match["_result"],
+                            "File":   rf_name,
+                        }
+                        if not t1_simple:
+                            for c in extra_cols:
+                                result_row[c] = match.get(c, "")
+                        all_results.append(result_row)
+                    else:
+                        all_results.append({
+                            "Input":  q_raw,
+                            "Result": "NOT FOUND",
+                            "File":   rf_name,
+                        })
+
+            if t1_only_matches:
+                all_results = [r for r in all_results if r.get("Result") != "NOT FOUND"]
+
+        if not all_results:
+            st.warning("No results found. Check your column selections and query values.")
+            st.stop()
+
+        t1_result_df = pd.DataFrame(all_results)
+
+        # Summary
+        if t1_mode.startswith("🔍"):
+            st.success(f"**{len(t1_result_df):,}** matches found across {len(t1_ref_configs)} file(s).")
+        else:
+            total = len(t1_query_seqs) * len(t1_ref_configs)
+            found = int((t1_result_df["Result"] != "NOT FOUND").sum())
+            st.success(f"**{found:,} / {total:,}** items matched.")
+
+        # Results table
+        st.dataframe(t1_result_df, use_container_width=True)
+
+        # Courier New rendering if sequences present
+        seq_cols = [c for c in t1_result_df.columns if any(
+            k in str(c).lower() for k in ["seq", "match", "result", "5'"]
+        )]
+        if seq_cols:
+            with st.expander("View sequences in Courier New", expanded=False):
+                display_cols = ["Query" if "Query" in t1_result_df.columns else "Input"] + seq_cols
+                display_cols = [c for c in display_cols if c in t1_result_df.columns]
+                seq_html = t1_result_df[display_cols].to_html(index=False, escape=False)
+                seq_html = seq_html.replace(
+                    "<td>",
+                    "<td style='font-family: Courier New; font-size: 11pt;'>"
+                )
+                st.markdown(seq_html, unsafe_allow_html=True)
+
+        # Downloads
+        import io as _io
+        dl_col1, dl_col2 = st.columns(2)
+        with dl_col1:
+            t1_xlsx_buf = _io.BytesIO()
+            with pd.ExcelWriter(t1_xlsx_buf, engine="openpyxl") as writer:
+                t1_result_df.to_excel(writer, index=False)
+            t1_xlsx_buf.seek(0)
+            st.download_button(
+                "⬇️ Download as .xlsx",
+                data=t1_xlsx_buf,
+                file_name="search_map_results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="t1_dl_xlsx",
+            )
+        with dl_col2:
+            st.download_button(
+                "⬇️ Download as .csv",
+                data=t1_result_df.to_csv(index=False).encode("utf-8"),
+                file_name="search_map_results.csv",
+                mime="text/csv",
+                key="t1_dl_csv",
+            )
+
 
 # Tab 2: Reverse Complement
 with tab2:
@@ -450,198 +636,8 @@ with tab2:
         html = df.to_html(index=False, escape=False)  # escape=False to render HTML
         st.markdown(html, unsafe_allow_html=True)
 
-# Tab 3: Melting Temp Calculator
-with tab3:
-    with st.expander("About This Tab"):
-        st.write("**Nearest Neighbor Tables:**")
-        st.write("- DNA_NN3: SantaLucia, J. (1998). A unified view of polymer, dumbbell, and oligonucleotide DNA nearest-neighbor thermodynamics. Proceedings of the National Academy of Sciences of the United States of America, 95(4), 1460–1465. https://doi.org/10.1073/pnas.95.4.1460")
-        st.write("- DNA_NN4: SantaLucia, J., & Hicks, D. (2004). The thermodynamics of DNA structural motifs. Annual Review of Biophysics and Biomolecular Structure, 33, 415–440. https://doi.org/10.1146/annurev.biophys.32.110601.141800")
-        st.write("- RNA_NN2: Freier, S. M., Kierzek, R., Jaeger, J. A., Sugimoto, N., Caruthers, M. H., Neilson, T., & Turner, D. H. (1986). Improved free-energy parameters for predictions of RNA duplex stability. Proceedings of the National Academy of Sciences of the United States of America, 83(24), 9373–9377. https://doi.org/10.1073/pnas.83.24.9373")
-        st.write("- RNA_NN3: Xia, T., SantaLucia, J., Burkard, M. E., Kierzek, R., Schroeder, S. J., Jiao, X., Cox, C., & Turner, D. H. (1998). Thermodynamic parameters for an expanded nearest-neighbor model for formation of RNA duplexes with Watson-Crick base pairs. Biochemistry, 37(41), 14719–14735. https://doi.org/10.1021/bi9809425")
-        st.write("**Salt Correction Methods:**")
-        st.write("- Schildkraut (1965): Schildkraut, C. (1965). Dependence of the melting temperature of DNA on salt concentration. Biopolymers, 3(2), 195–208. https://doi.org/10.1002/bip.360030207")
-        st.write("- SantaLucia (1998): SantaLucia, J. (1998). A unified view of polymer, dumbbell, and oligonucleotide DNA nearest-neighbor thermodynamics. Proceedings of the National Academy of Sciences of the United States of America, 95(4), 1460–1465. https://doi.org/10.1073/pnas.95.4.1460")
-        st.write("- Owczarzy (2004): Owczarzy, R., You, Y., Moreira, B. G., Owczarzy, J. A., Grollman, L. G., Behlke, M. A., & Walder, J. A. (2004). Effects of sodium ions on DNA duplex oligomers: improved predictions of melting temperatures. Biochemistry, 43(12), 3537–3554. https://doi.org/10.1021/bi034621r")
-        st.write("- Owczarzy (2008): Owczarzy, R., Tataurov, A. V., Wu, Y., Manthey, J. A., McQuisten, K. A., Almabrazi, H. G., Pedersen, K. F., Lin, Y., Garretson, J., McEntaggart, N. G., Sailor, C. A., Dawson, R. B., & Peek, A. S. (2008). IDT SciTools: a suite for analysis and design of oligonucleotide based molecular diagnostics. Nucleic Acids Research, 36(Web Server issue), W163–W169. https://doi.org/10.1093/nar/gkn161")
-
-    st.header("Melting Temperature Calculator")
-    seq_input = st.text_area("Enter sequence (5' to 3')").upper()
-    duplex_type = st.selectbox("Duplex type", ["DNA/DNA", "DNA/RNA", "RNA/RNA"])
-    nn_table = st.selectbox("Nearest Neighbor Table", ["DNA_NN3 (SantaLucia 1998)", "DNA_NN4 (SantaLucia 2004)", "RNA_NN2 (Freier 1986)", "RNA_NN3 (Xia 1998)"])
-    Na = st.number_input("Na+ concentration (mM)", value=137.0)  # Updated to 137 mM for PBS
-    K = st.number_input("K+ concentration (mM)", value=0.0)
-    Tris = st.number_input("Tris concentration (mM)", value=0.0)
-    Mg = st.number_input("Mg2+ concentration (mM)", value=0.0)
-    dNTPs = st.number_input("dNTPs concentration (mM)", value=0.0)
-    saltcorr = st.selectbox("Salt correction method", ["Schildkraut (1965)", "SantaLucia (1998)", "Owczarzy (2004)", "Owczarzy (2008)"])
-
-    if st.button("Calculate Tm"):
-        if duplex_type == "DNA/DNA":
-            check = 'dna'
-        elif duplex_type == "DNA/RNA":
-            check = 'dna'
-        elif duplex_type == "RNA/RNA":
-            check = 'rna'
-        if nn_table == "DNA_NN3 (SantaLucia 1998)":
-            nn_table = mt.DNA_NN3
-        elif nn_table == "DNA_NN4 (SantaLucia 2004)":
-            nn_table = mt.DNA_NN4
-        elif nn_table == "RNA_NN2 (Freier 1986)":
-            nn_table = mt.RNA_NN2
-        elif nn_table == "RNA_NN3 (Xia 1998)":
-            nn_table = mt.RNA_NN3
-        if saltcorr == "Schildkraut (1965)":
-            saltcorr = 1
-        elif saltcorr == "SantaLucia (1998)":
-            saltcorr = 4
-        elif saltcorr == "Owczarzy (2004)":
-            saltcorr = 5
-        elif saltcorr == "Owczarzy (2008)":
-            saltcorr = 7
-
-        Tm = mt.Tm_NN(seq_input, check=check, nn_table=nn_table, Na=Na, K=K, Tris=Tris, Mg=Mg, dNTPs=dNTPs, saltcorr=saltcorr)
-        st.write(f"Melting Temperature (Tm): {Tm:.2f} °C")
-        st.write("Reference: SantaLucia J Jr (1998) A unified view of polymer, dumbbell, and oligonucleotide DNA nearest-neighbor thermodynamics. Proc Natl Acad Sci U S A 95(3):1460-1465.")
-
-# Tab 4: Venn Diagrams with Sequence Extraction
-with tab4:
-    with st.expander("About This Tab"):
-        st.write("Visualize overlaps between 2-4 sequence sets from uploaded files, with downloadable 2-, 3-, and 4-set diagrams and selectable intersection regions for export of those sequences.  Use 'Run Comparison' to analyze exact or fuzzy matches.  Sequences for any region in a 2-, 3-, or 4-way Venn Diagram (corresponding to two, three, or four files) can be extracted by selecting the appropriate region in the drop-down menu on the left side pane.  More than a single region can be selected. Please don't forget to scroll all the way down after hitting the button for \"Run X-way Venn Comparison\". Four-way Venn diagrams will not render in this same browser tab so you must open the separate HTML tab that gets generated for 4-way Venn diagrams.  Region selections don't show up the first time without making at least ONE column selection in the file previews, OR run it a 2nd time.  A selection will populate the dropdown with a red bar showing the intended selection then hit run again.  What can I say, I'm not a real programmer - Bill Jackson, July 2025.")
-        st.write("[See detailed guide](https://github.com/your-repo/README.md#venn-diagram)")
-
-    st.header("Overlap Viewer")
-    # Sidebar for controls and intersection selection
-    with st.sidebar:
-        script_name = os.path.basename(__file__)  # Dynamically get the script filename
-        st.caption(f"Name of script: {script_name}")  # Updated to dynamic name
-        st.header("Venn Diagram Controls")
-        venn_files = st.file_uploader("Upload files for overlap", type=["csv", "xlsx", "fastq", "fq"], accept_multiple_files=True)
-        if venn_files and 2 <= len(venn_files) <= 5:
-            match_type = st.radio("Match type", ["Exact", "Fuzzy"], key="vennmatch")
-            mismatches = st.slider("Allowed mismatches", 1, 5, 1, key="mismatch") if match_type == "Fuzzy" else 0
-            allow_rc = st.checkbox("Match reverse complement", value=False)  # Disabled temporarily
-        # Populate intersection selection dynamically
-        intersection_labels = st.session_state.get("intersection_labels", [])
-        selected_intersections = st.multiselect("Select intersections to extract sequences", intersection_labels, key="intersection_select")
-# ----- BEGIN 4/5-WAY NOTE IN SIDEBAR -----
-        if venn_files and len(venn_files) in (4, 5):
-            n = len(venn_files)
-            if PYVENN_AVAILABLE:
-                st.info(f"{n}-way: geometric Venn diagram (pyvenn). Letters A–{'O' if n==4 else 'AE'} match dropdown.")
-            elif UPSETPLOT_AVAILABLE:
-                st.info(f"{n}-way: UpSet plot with letter labels. Letters A–{'O' if n==4 else 'AE'} match dropdown.")
-            else:
-                st.warning("Install **upsetplot** or **venn** (pyvenn) for richer diagrams. Bar-chart fallback active.")
-        # ----- END 4/5-WAY NOTE IN SIDEBAR -----
-
-    if venn_files and 2 <= len(venn_files) <= 5:
-        sets = {}
-        for i, file in enumerate(venn_files):
-            ext = file.name.split(".")[-1].lower()
-            label = st.text_input(f"Label for file {i+1}", value=file.name, key=f"label_{i}")
-            if ext in ["csv", "xlsx"]:
-                df = pd.read_csv(file) if ext == "csv" else pd.read_excel(file)
-                st.dataframe(df.head())
-                default_col = "Trimmed" if "Trimmed" in df.columns else df.columns[0]
-                col = st.selectbox(f"Sequence column in {label}", df.columns,
-                                   index=df.columns.get_loc(default_col))
-                seqs = df[col].dropna().astype(str).str.upper().tolist()
-            elif ext in ["fastq", "fq"]:
-                lines = file.read().decode("utf-8").splitlines()
-                seqs = extract_fastq_sequences(lines)
-            else:
-                seqs = []
-            if allow_rc:
-                seqs += [reverse_complement(s) for s in seqs]
-            sets[label] = set(seqs)
-
-        num_sets = len(venn_files)
-        keys = list(sets.keys())
-
-        # ── Compute all intersections via shared helper ─────────────────────
-        intersections, intersection_labels = build_intersections(sets, keys)
-
-        # Preview diagram before Run button (2- and 3-way only)
-        venn_colors = ['#ff9999', '#99ff99', '#9999ff', '#ffcc99', '#cc99ff']
-        if num_sets == 2:
-            fig, ax = plt.subplots()
-            venn2([sets[keys[0]], sets[keys[1]]], set_labels=keys, ax=ax)
-            patches = [mpatches.Patch(color=c, label=k) for k, c in zip(keys, venn_colors[:2])]
-            ax.legend(handles=patches, loc='upper right')
-            st.pyplot(fig);  plt.close(fig)
-        elif num_sets == 3:
-            fig, ax = plt.subplots()
-            venn3([sets[keys[0]], sets[keys[1]], sets[keys[2]]], set_labels=keys, ax=ax)
-            patches = [mpatches.Patch(color=c, label=k) for k, c in zip(keys, venn_colors[:3])]
-            ax.legend(handles=patches, loc='upper right')
-            st.pyplot(fig);  plt.close(fig)
-
-        # Update sidebar dropdown
-        st.session_state["intersection_labels"] = intersection_labels
-
-        if st.button(f"Run {num_sets}-Set Venn Comparison"):
-
-            st.subheader(f"{num_sets}-Set Overlap Diagram")
-
-            if num_sets == 2:
-                fig, ax = plt.subplots()
-                venn2([sets[keys[0]], sets[keys[1]]], set_labels=keys, ax=ax)
-                patches = [mpatches.Patch(color=c, label=k) for k, c in zip(keys, venn_colors[:2])]
-                ax.legend(handles=patches, loc='upper right')
-                st.pyplot(fig);  plt.close(fig)
-
-            elif num_sets == 3:
-                fig, ax = plt.subplots()
-                venn3([sets[keys[0]], sets[keys[1]], sets[keys[2]]], set_labels=keys, ax=ax)
-                patches = [mpatches.Patch(color=c, label=k) for k, c in zip(keys, venn_colors[:3])]
-                ax.legend(handles=patches, loc='upper right')
-                st.pyplot(fig);  plt.close(fig)
-
-            elif num_sets in (4, 5):
-                # Priority: pyvenn geometric > upsetplot > bar-chart fallback
-                if PYVENN_AVAILABLE:
-                    st.info("Showing geometric Venn (pyvenn). Letters on bars match the dropdown.")
-                    fig_pv = create_pyvenn_figure(sets, keys)
-                    if fig_pv is not None:
-                        st.pyplot(fig_pv);  plt.close(fig_pv)
-                    # Also show UpSet underneath if available for letter reference
-                    if UPSETPLOT_AVAILABLE:
-                        st.markdown("**UpSet plot with region letters (use these to pick from dropdown):**")
-                        fig_up = create_upset_figure(sets, keys, intersections)
-                        if fig_up is not None:
-                            st.pyplot(fig_up);  plt.close(fig_up)
-                elif UPSETPLOT_AVAILABLE:
-                    fig_up = create_upset_figure(sets, keys, intersections)
-                    if fig_up is not None:
-                        st.pyplot(fig_up);  plt.close(fig_up)
-                    else:
-                        st.warning("UpSet plot failed to render.")
-                else:
-                    st.info("Install **upsetplot** or **venn** (pyvenn) for richer diagrams. "
-                            "Showing bar-chart fallback.")
-                    fig_fb = create_summary_figure(intersections, keys)
-                    st.pyplot(fig_fb);  plt.close(fig_fb)
-
-            # ── Sequence extraction from selected intersections ──────────────
-            selected_intersections = st.session_state.get("intersection_select", [])
-            if selected_intersections:
-                selected_seqs = set()
-                for lbl in selected_intersections:
-                    selected_seqs.update(intersections.get(lbl, set()))
-                if selected_seqs:
-                    st.subheader("Sequences in Selected Intersections")
-                    df_seqs = pd.DataFrame({"Sequence": sorted(selected_seqs)})
-                    st.dataframe(df_seqs)
-                    st.download_button("Download sequences as CSV",
-                                       df_seqs.to_csv(index=False),
-                                       file_name="selected_sequences.csv")
-                else:
-                    st.write("No sequences found in the selected intersections.")
-    else:
-        if venn_files and (len(venn_files) < 2 or len(venn_files) > 5):
-            st.warning("Please upload 2 to 5 files for Venn diagram analysis.")
 # ============================================================================
-# Tab 5: DNA & RNA Folding (added in v6)
+# Tab 3: DNA & RNA Folding (added in v6)
 # ----------------------------------------------------------------------------
 # Standalone secondary-structure folder using ViennaRNA, with correct DNA
 # energy parameters (Mathews 2004/1999) and Owczarzy 2008 monovalent-salt
@@ -735,7 +731,7 @@ def _arc_diagram_v6(seq, structure, title=""):
     return fig
 
 
-with tab5:
+with tab3:
     with st.expander("About This Tab"):
         st.write(
             "Fold one or more DNA or RNA sequences using ViennaRNA. "
@@ -956,3 +952,193 @@ with tab5:
                     mime="text/csv",
                     key="v6_download"
                 )
+# Tab 4: Melting Temp Calculator
+with tab4:
+    with st.expander("About This Tab"):
+        st.write("**Nearest Neighbor Tables:**")
+        st.write("- DNA_NN3: SantaLucia, J. (1998). A unified view of polymer, dumbbell, and oligonucleotide DNA nearest-neighbor thermodynamics. Proceedings of the National Academy of Sciences of the United States of America, 95(4), 1460–1465. https://doi.org/10.1073/pnas.95.4.1460")
+        st.write("- DNA_NN4: SantaLucia, J., & Hicks, D. (2004). The thermodynamics of DNA structural motifs. Annual Review of Biophysics and Biomolecular Structure, 33, 415–440. https://doi.org/10.1146/annurev.biophys.32.110601.141800")
+        st.write("- RNA_NN2: Freier, S. M., Kierzek, R., Jaeger, J. A., Sugimoto, N., Caruthers, M. H., Neilson, T., & Turner, D. H. (1986). Improved free-energy parameters for predictions of RNA duplex stability. Proceedings of the National Academy of Sciences of the United States of America, 83(24), 9373–9377. https://doi.org/10.1073/pnas.83.24.9373")
+        st.write("- RNA_NN3: Xia, T., SantaLucia, J., Burkard, M. E., Kierzek, R., Schroeder, S. J., Jiao, X., Cox, C., & Turner, D. H. (1998). Thermodynamic parameters for an expanded nearest-neighbor model for formation of RNA duplexes with Watson-Crick base pairs. Biochemistry, 37(41), 14719–14735. https://doi.org/10.1021/bi9809425")
+        st.write("**Salt Correction Methods:**")
+        st.write("- Schildkraut (1965): Schildkraut, C. (1965). Dependence of the melting temperature of DNA on salt concentration. Biopolymers, 3(2), 195–208. https://doi.org/10.1002/bip.360030207")
+        st.write("- SantaLucia (1998): SantaLucia, J. (1998). A unified view of polymer, dumbbell, and oligonucleotide DNA nearest-neighbor thermodynamics. Proceedings of the National Academy of Sciences of the United States of America, 95(4), 1460–1465. https://doi.org/10.1073/pnas.95.4.1460")
+        st.write("- Owczarzy (2004): Owczarzy, R., You, Y., Moreira, B. G., Owczarzy, J. A., Grollman, L. G., Behlke, M. A., & Walder, J. A. (2004). Effects of sodium ions on DNA duplex oligomers: improved predictions of melting temperatures. Biochemistry, 43(12), 3537–3554. https://doi.org/10.1021/bi034621r")
+        st.write("- Owczarzy (2008): Owczarzy, R., Tataurov, A. V., Wu, Y., Manthey, J. A., McQuisten, K. A., Almabrazi, H. G., Pedersen, K. F., Lin, Y., Garretson, J., McEntaggart, N. G., Sailor, C. A., Dawson, R. B., & Peek, A. S. (2008). IDT SciTools: a suite for analysis and design of oligonucleotide based molecular diagnostics. Nucleic Acids Research, 36(Web Server issue), W163–W169. https://doi.org/10.1093/nar/gkn161")
+
+    st.header("Melting Temperature Calculator")
+    seq_input = st.text_area("Enter sequence (5' to 3')").upper()
+    duplex_type = st.selectbox("Duplex type", ["DNA/DNA", "DNA/RNA", "RNA/RNA"])
+    nn_table = st.selectbox("Nearest Neighbor Table", ["DNA_NN3 (SantaLucia 1998)", "DNA_NN4 (SantaLucia 2004)", "RNA_NN2 (Freier 1986)", "RNA_NN3 (Xia 1998)"])
+    Na = st.number_input("Na+ concentration (mM)", value=137.0)  # Updated to 137 mM for PBS
+    K = st.number_input("K+ concentration (mM)", value=0.0)
+    Tris = st.number_input("Tris concentration (mM)", value=0.0)
+    Mg = st.number_input("Mg2+ concentration (mM)", value=0.0)
+    dNTPs = st.number_input("dNTPs concentration (mM)", value=0.0)
+    saltcorr = st.selectbox("Salt correction method", ["Schildkraut (1965)", "SantaLucia (1998)", "Owczarzy (2004)", "Owczarzy (2008)"])
+
+    if st.button("Calculate Tm"):
+        if duplex_type == "DNA/DNA":
+            check = 'dna'
+        elif duplex_type == "DNA/RNA":
+            check = 'dna'
+        elif duplex_type == "RNA/RNA":
+            check = 'rna'
+        if nn_table == "DNA_NN3 (SantaLucia 1998)":
+            nn_table = mt.DNA_NN3
+        elif nn_table == "DNA_NN4 (SantaLucia 2004)":
+            nn_table = mt.DNA_NN4
+        elif nn_table == "RNA_NN2 (Freier 1986)":
+            nn_table = mt.RNA_NN2
+        elif nn_table == "RNA_NN3 (Xia 1998)":
+            nn_table = mt.RNA_NN3
+        if saltcorr == "Schildkraut (1965)":
+            saltcorr = 1
+        elif saltcorr == "SantaLucia (1998)":
+            saltcorr = 4
+        elif saltcorr == "Owczarzy (2004)":
+            saltcorr = 5
+        elif saltcorr == "Owczarzy (2008)":
+            saltcorr = 7
+
+        Tm = mt.Tm_NN(seq_input, check=check, nn_table=nn_table, Na=Na, K=K, Tris=Tris, Mg=Mg, dNTPs=dNTPs, saltcorr=saltcorr)
+        st.write(f"Melting Temperature (Tm): {Tm:.2f} °C")
+        st.write("Reference: SantaLucia J Jr (1998) A unified view of polymer, dumbbell, and oligonucleotide DNA nearest-neighbor thermodynamics. Proc Natl Acad Sci U S A 95(3):1460-1465.")
+
+# Tab 5: Venn Diagrams with Sequence Extraction
+with tab5:
+    with st.expander("About This Tab"):
+        st.write("Visualize overlaps between 2-4 sequence sets from uploaded files, with downloadable 2-, 3-, and 4-set diagrams and selectable intersection regions for export of those sequences.  Use 'Run Comparison' to analyze exact or fuzzy matches.  Sequences for any region in a 2-, 3-, or 4-way Venn Diagram (corresponding to two, three, or four files) can be extracted by selecting the appropriate region in the drop-down menu on the left side pane.  More than a single region can be selected. Please don't forget to scroll all the way down after hitting the button for \"Run X-way Venn Comparison\". Four-way Venn diagrams will not render in this same browser tab so you must open the separate HTML tab that gets generated for 4-way Venn diagrams.  Region selections don't show up the first time without making at least ONE column selection in the file previews, OR run it a 2nd time.  A selection will populate the dropdown with a red bar showing the intended selection then hit run again.  What can I say, I'm not a real programmer - Bill Jackson, July 2025.")
+        st.write("[See detailed guide](https://github.com/your-repo/README.md#venn-diagram)")
+
+    st.header("Overlap Viewer")
+    # Sidebar for controls and intersection selection
+    with st.sidebar:
+        script_name = os.path.basename(__file__)  # Dynamically get the script filename
+        st.caption(f"Name of script: {script_name}")  # Updated to dynamic name
+        st.header("Venn Diagram Controls")
+        venn_files = st.file_uploader("Upload files for overlap", type=["csv", "xlsx", "fastq", "fq"], accept_multiple_files=True)
+        if venn_files and 2 <= len(venn_files) <= 5:
+            match_type = st.radio("Match type", ["Exact", "Fuzzy"], key="vennmatch")
+            mismatches = st.slider("Allowed mismatches", 1, 5, 1, key="mismatch") if match_type == "Fuzzy" else 0
+            allow_rc = st.checkbox("Match reverse complement", value=False)  # Disabled temporarily
+        # Populate intersection selection dynamically
+        intersection_labels = st.session_state.get("intersection_labels", [])
+        selected_intersections = st.multiselect("Select intersections to extract sequences", intersection_labels, key="intersection_select")
+# ----- BEGIN 4/5-WAY NOTE IN SIDEBAR -----
+        if venn_files and len(venn_files) in (4, 5):
+            n = len(venn_files)
+            if PYVENN_AVAILABLE:
+                st.info(f"{n}-way: geometric Venn diagram (pyvenn). Letters A–{'O' if n==4 else 'AE'} match dropdown.")
+            elif UPSETPLOT_AVAILABLE:
+                st.info(f"{n}-way: UpSet plot with letter labels. Letters A–{'O' if n==4 else 'AE'} match dropdown.")
+            else:
+                st.warning("Install **upsetplot** or **venn** (pyvenn) for richer diagrams. Bar-chart fallback active.")
+        # ----- END 4/5-WAY NOTE IN SIDEBAR -----
+
+    if venn_files and 2 <= len(venn_files) <= 5:
+        sets = {}
+        for i, file in enumerate(venn_files):
+            ext = file.name.split(".")[-1].lower()
+            label = st.text_input(f"Label for file {i+1}", value=file.name, key=f"label_{i}")
+            if ext in ["csv", "xlsx"]:
+                df = pd.read_csv(file) if ext == "csv" else pd.read_excel(file)
+                st.dataframe(df.head())
+                default_col = "Trimmed" if "Trimmed" in df.columns else df.columns[0]
+                col = st.selectbox(f"Sequence column in {label}", df.columns,
+                                   index=df.columns.get_loc(default_col))
+                seqs = df[col].dropna().astype(str).str.upper().tolist()
+            elif ext in ["fastq", "fq"]:
+                lines = file.read().decode("utf-8").splitlines()
+                seqs = extract_fastq_sequences(lines)
+            else:
+                seqs = []
+            if allow_rc:
+                seqs += [reverse_complement(s) for s in seqs]
+            sets[label] = set(seqs)
+
+        num_sets = len(venn_files)
+        keys = list(sets.keys())
+
+        # ── Compute all intersections via shared helper ─────────────────────
+        intersections, intersection_labels = build_intersections(sets, keys)
+
+        # Preview diagram before Run button (2- and 3-way only)
+        venn_colors = ['#ff9999', '#99ff99', '#9999ff', '#ffcc99', '#cc99ff']
+        if num_sets == 2:
+            fig, ax = plt.subplots()
+            venn2([sets[keys[0]], sets[keys[1]]], set_labels=keys, ax=ax)
+            patches = [mpatches.Patch(color=c, label=k) for k, c in zip(keys, venn_colors[:2])]
+            ax.legend(handles=patches, loc='upper right')
+            st.pyplot(fig);  plt.close(fig)
+        elif num_sets == 3:
+            fig, ax = plt.subplots()
+            venn3([sets[keys[0]], sets[keys[1]], sets[keys[2]]], set_labels=keys, ax=ax)
+            patches = [mpatches.Patch(color=c, label=k) for k, c in zip(keys, venn_colors[:3])]
+            ax.legend(handles=patches, loc='upper right')
+            st.pyplot(fig);  plt.close(fig)
+
+        # Update sidebar dropdown
+        st.session_state["intersection_labels"] = intersection_labels
+
+        if st.button(f"Run {num_sets}-Set Venn Comparison"):
+
+            st.subheader(f"{num_sets}-Set Overlap Diagram")
+
+            if num_sets == 2:
+                fig, ax = plt.subplots()
+                venn2([sets[keys[0]], sets[keys[1]]], set_labels=keys, ax=ax)
+                patches = [mpatches.Patch(color=c, label=k) for k, c in zip(keys, venn_colors[:2])]
+                ax.legend(handles=patches, loc='upper right')
+                st.pyplot(fig);  plt.close(fig)
+
+            elif num_sets == 3:
+                fig, ax = plt.subplots()
+                venn3([sets[keys[0]], sets[keys[1]], sets[keys[2]]], set_labels=keys, ax=ax)
+                patches = [mpatches.Patch(color=c, label=k) for k, c in zip(keys, venn_colors[:3])]
+                ax.legend(handles=patches, loc='upper right')
+                st.pyplot(fig);  plt.close(fig)
+
+            elif num_sets in (4, 5):
+                # Priority: pyvenn geometric > upsetplot > bar-chart fallback
+                if PYVENN_AVAILABLE:
+                    st.info("Showing geometric Venn (pyvenn). Letters on bars match the dropdown.")
+                    fig_pv = create_pyvenn_figure(sets, keys)
+                    if fig_pv is not None:
+                        st.pyplot(fig_pv);  plt.close(fig_pv)
+                    # Also show UpSet underneath if available for letter reference
+                    if UPSETPLOT_AVAILABLE:
+                        st.markdown("**UpSet plot with region letters (use these to pick from dropdown):**")
+                        fig_up = create_upset_figure(sets, keys, intersections)
+                        if fig_up is not None:
+                            st.pyplot(fig_up);  plt.close(fig_up)
+                elif UPSETPLOT_AVAILABLE:
+                    fig_up = create_upset_figure(sets, keys, intersections)
+                    if fig_up is not None:
+                        st.pyplot(fig_up);  plt.close(fig_up)
+                    else:
+                        st.warning("UpSet plot failed to render.")
+                else:
+                    st.info("Install **upsetplot** or **venn** (pyvenn) for richer diagrams. "
+                            "Showing bar-chart fallback.")
+                    fig_fb = create_summary_figure(intersections, keys)
+                    st.pyplot(fig_fb);  plt.close(fig_fb)
+
+            # ── Sequence extraction from selected intersections ──────────────
+            selected_intersections = st.session_state.get("intersection_select", [])
+            if selected_intersections:
+                selected_seqs = set()
+                for lbl in selected_intersections:
+                    selected_seqs.update(intersections.get(lbl, set()))
+                if selected_seqs:
+                    st.subheader("Sequences in Selected Intersections")
+                    df_seqs = pd.DataFrame({"Sequence": sorted(selected_seqs)})
+                    st.dataframe(df_seqs)
+                    st.download_button("Download sequences as CSV",
+                                       df_seqs.to_csv(index=False),
+                                       file_name="selected_sequences.csv")
+                else:
+                    st.write("No sequences found in the selected intersections.")
+    else:
+        if venn_files and (len(venn_files) < 2 or len(venn_files) > 5):
+            st.warning("Please upload 2 to 5 files for Venn diagram analysis.")
