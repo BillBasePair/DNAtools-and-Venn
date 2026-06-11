@@ -148,77 +148,90 @@ def build_intersections(sets, keys):
 
 
 # ── UpSet plot with A–O / A–AE letter labels on bars ─────────────────────────
-def create_upset_figure(sets, keys, intersections):
-    """Build an UpSet plot and annotate each bar with its region letter.
-    Letters are placed BELOW the dot matrix so they never collide with counts.
-    Works for 4 or 5 sets. Returns matplotlib Figure or None."""
-    if not UPSETPLOT_AVAILABLE:
-        return None
+def create_upset_figure(sets, keys, intersections=None):
+    """Pure-matplotlib UpSet plot (no upsetplot dependency).
+
+    Top:    bar chart of exclusive-region sizes, sorted largest-first.
+    Bottom: dot matrix showing which sets each bar belongs to, with a red
+            region letter under each column (matches the extraction dropdown).
+    Works for 4 or 5 sets. Returns a matplotlib Figure, or None if no regions.
+
+    NOTE: this was rewritten away from the upsetplot library because upsetplot
+    0.9.0 (its newest release) is incompatible with pandas 3.x — its chained
+    `styles[col].fillna(..., inplace=True)` calls are silent no-ops under
+    Copy-on-Write, leaving NaNs that crash matplotlib (the "linestyles -> dashes"
+    error), plus a second break in its count-label positioning. Drawing the plot
+    with plain matplotlib primitives sidesteps all of those version mismatches.
+    """
+    from itertools import combinations as _comb
+
     n = len(keys)
-    label_map = LABELS_4WAY if n == 4 else (LABELS_5WAY if n == 5 else {})
+    if n not in (4, 5):
+        return None
+    label_map = LABELS_4WAY if n == 4 else LABELS_5WAY
 
-    all_seqs = set().union(*sets.values())
-    memberships = []
-    for seq in all_seqs:
-        member_of = tuple(k for k in keys if seq in sets[k])
-        if member_of:
-            memberships.append(member_of)
+    # Exclusive (disjoint) size of every present combination — same logic as
+    # build_intersections(), so counts agree with the Venn and the dropdown.
+    regions = []  # (frozenset_of_indices, count, letter)
+    for r in range(1, n + 1):
+        for combo in _comb(range(n), r):
+            cs = frozenset(combo)
+            inter = set.intersection(*(sets[keys[i]] for i in combo))
+            outside = [keys[i] for i in range(n) if i not in combo]
+            if outside:
+                inter = inter - set.union(*(sets[k] for k in outside))
+            if inter:
+                regions.append((cs, len(inter), label_map.get(cs, "?")))
+    if not regions:
+        return None
 
-    data = from_memberships(memberships)
-    # Extra bottom margin so the letter row fits under the dot matrix
-    fig = plt.figure(figsize=(14, 7))
-    fig.subplots_adjust(bottom=0.18)
-    upset = UpSet(data, subset_size="count", show_counts=True, sort_by="cardinality")
+    regions.sort(key=lambda t: t[1], reverse=True)   # cardinality order
+    n_cols = len(regions)
+    xs = list(range(n_cols))
+    counts = [c for _, c, _ in regions]
 
-    # ── Patch ax.scatter to sanitize edgecolors before upsetplot passes them ──
-    # upsetplot 0.9.0 passes pandas Series as edgecolors; matplotlib 3.9+ rejects this.
-    import matplotlib.axes._axes as _mpl_axes
-    import numpy as _np
-    import pandas as _pd
-    _orig_scatter = _mpl_axes.Axes.scatter
-    def _patched_scatter(self, *args, **kwargs):
-        if "edgecolors" in kwargs:
-            ec = kwargs["edgecolors"]
-            if isinstance(ec, (_pd.Series, _pd.Index)):
-                kwargs["edgecolors"] = ec.tolist()
-            elif hasattr(ec, "values"):
-                kwargs["edgecolors"] = list(ec)
-        return _orig_scatter(self, *args, **kwargs)
-    _mpl_axes.Axes.scatter = _patched_scatter
+    fig = plt.figure(figsize=(max(10, n_cols * 0.55), 7))
+    gs = fig.add_gridspec(2, 1, height_ratios=[3, 1.4], hspace=0.05)
+    ax_bar = fig.add_subplot(gs[0])
+    ax_mat = fig.add_subplot(gs[1], sharex=ax_bar)
 
-    axes_dict = upset.plot(fig)
+    # ── bar chart ──
+    ax_bar.bar(xs, counts, width=0.6, color="#4C72B0", zorder=3)
+    for x, c in zip(xs, counts):
+        ax_bar.text(x, c, str(c), ha="center", va="bottom", fontsize=8)
+    ax_bar.set_ylabel("Region size\n(exclusive)", fontsize=10)
+    ax_bar.set_ylim(0, max(counts) * 1.15)
+    ax_bar.spines[["top", "right"]].set_visible(False)
+    ax_bar.tick_params(labelbottom=False, bottom=False)
+    ax_bar.set_title(f"{n}-Set Overlap (UpSet) — red letters match the dropdown",
+                     fontsize=12)
 
-    # Restore original scatter after plot
-    _mpl_axes.Axes.scatter = _orig_scatter
-    plt.suptitle(f"{n}-Set Overlap (UpSet Plot) — red letters match dropdown",
-                 fontsize=12, y=1.02)
+    # ── dot matrix ──
+    ys = list(range(n))
+    for yi in ys:                                    # faint zebra bands
+        ax_mat.axhspan(yi - 0.5, yi + 0.5,
+                       color=("#f0f0f0" if yi % 2 == 0 else "white"), zorder=0)
+    for x, (members, _, _) in zip(xs, regions):
+        ax_mat.scatter([x] * n, ys, s=120, color="#cfcfcf", zorder=2)  # empty dots
+        active = sorted(members)
+        if active:
+            ax_mat.scatter([x] * len(active), active, s=120,
+                           color="#333333", zorder=3)                  # filled dots
+            if len(active) > 1:
+                ax_mat.plot([x, x], [min(active), max(active)],
+                            color="#333333", lw=2, zorder=2)            # connector
+    for x, (_, _, letter) in zip(xs, regions):
+        ax_mat.text(x, -0.95, letter, ha="center", va="top",
+                    fontsize=9, fontweight="bold", color="red")
 
-    # ── Place letter labels in the dot-matrix axis, one row below the lowest dots ──
-    # "matrix" axis holds the dot grid; we annotate along its x positions.
-    matrix_ax = axes_dict.get("matrix")
-    bar_ax    = axes_dict.get("intersections")
-
-    if bar_ax is not None and matrix_ax is not None:
-        # Derive the sorted column order from the data index (same sort as UpSet)
-        counts = data.groupby(level=list(range(n))).size().sort_values(ascending=False)
-
-        # Get x-centre of each bar from the bar axis
-        bars = bar_ax.patches
-        for bar, (idx_tuple, _) in zip(bars, counts.items()):
-            member_indices = frozenset(i for i, v in enumerate(idx_tuple) if v)
-            letter = label_map.get(member_indices, "?")
-            # x in bar_ax coordinates
-            x_bar = bar.get_x() + bar.get_width() / 2
-            # Convert to matrix_ax coordinates (same figure, x-axes are aligned)
-            # Place letter just below the bottom of the matrix axis (y < 0 in axes coords)
-            matrix_ax.text(
-                x_bar, -0.7, letter,
-                ha="center", va="top",
-                fontsize=10, fontweight="bold", color="red",
-                transform=matrix_ax.get_xaxis_transform(),
-                clip_on=False
-            )
-
+    ax_mat.set_yticks(ys)
+    ax_mat.set_yticklabels(keys, fontsize=9)
+    ax_mat.set_ylim(n - 0.5, -1.4)                   # set 0 on top + room for letters
+    ax_mat.set_xlim(-0.7, n_cols - 0.3)
+    ax_mat.set_xticks([])
+    ax_mat.spines[["top", "right", "bottom", "left"]].set_visible(False)
+    ax_mat.tick_params(left=False)
+    fig.subplots_adjust(left=0.18, right=0.98, top=0.92, bottom=0.06)
     return fig
 
 
@@ -238,13 +251,31 @@ def create_summary_figure(intersections, keys):
 
 # pyvenn geometric diagram (4 or 5-way true Venn ellipses)
 def create_pyvenn_figure(sets, keys):
-    """Use pyvenn to draw a geometric 4- or 5-way Venn. Returns Figure or None."""
+    """Use pyvenn to draw a geometric 4- or 5-way Venn. Returns Figure or None.
+
+    pyvenn normally drops its legend inside the axes (loc='upper right'), where
+    long file-name labels sit right on top of the ellipses. We suppress that
+    internal legend and park our own legend in reserved space below the diagram,
+    so the petals stay fully visible. Swatch colors are reproduced exactly the
+    way pyvenn colors its petals: ScalarMappable(viridis).to_rgba(range(n), 0.4).
+    """
     if not PYVENN_AVAILABLE:
         return None
-    fig, ax = plt.subplots(figsize=(10, 8))
-    venn(sets, ax=ax)
-    ax.set_title(f"{len(keys)}-Set Venn Diagram", fontsize=13)
-    plt.tight_layout()
+    n = len(keys)
+    fig, ax = plt.subplots(figsize=(11, 9))
+    venn(sets, ax=ax, legend_loc=None)          # suppress pyvenn's overlapping legend
+    ax.set_title(f"{n}-Set Venn Diagram", fontsize=14, pad=14)
+
+    # Rebuild a legend with the SAME colors pyvenn used, placed below the plot.
+    from matplotlib.cm import ScalarMappable
+    import matplotlib.patches as _mpatches
+    colors = ScalarMappable(cmap="viridis").to_rgba(range(n), alpha=0.4)
+    handles = [_mpatches.Patch(facecolor=c, edgecolor="none", label=k)
+               for c, k in zip(colors, keys)]
+    fig.subplots_adjust(bottom=0.24, top=0.92)
+    ncol = 2 if n >= 4 else n
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.02),
+              ncol=ncol, fontsize=9, frameon=True, borderaxespad=0.0)
     return fig
 
 # Main Streamlit app
@@ -1100,27 +1131,23 @@ with tab5:
                 st.pyplot(fig);  plt.close(fig)
 
             elif num_sets in (4, 5):
-                # Priority: pyvenn geometric > upsetplot > bar-chart fallback
+                # Geometric Venn (pyvenn) when available, plus the always-on
+                # UpSet plot. The UpSet is now pure matplotlib, so it no longer
+                # depends on the upsetplot library being importable.
                 if PYVENN_AVAILABLE:
-                    st.info("Showing geometric Venn (pyvenn). Letters on bars match the dropdown.")
+                    st.info("Showing geometric Venn (pyvenn). Letters on the UpSet bars match the dropdown.")
                     fig_pv = create_pyvenn_figure(sets, keys)
                     if fig_pv is not None:
                         st.pyplot(fig_pv);  plt.close(fig_pv)
-                    # Also show UpSet underneath if available for letter reference
-                    if UPSETPLOT_AVAILABLE:
-                        st.markdown("**UpSet plot with region letters (use these to pick from dropdown):**")
-                        fig_up = create_upset_figure(sets, keys, intersections)
-                        if fig_up is not None:
-                            st.pyplot(fig_up);  plt.close(fig_up)
-                elif UPSETPLOT_AVAILABLE:
-                    fig_up = create_upset_figure(sets, keys, intersections)
-                    if fig_up is not None:
-                        st.pyplot(fig_up);  plt.close(fig_up)
-                    else:
-                        st.warning("UpSet plot failed to render.")
                 else:
-                    st.info("Install **upsetplot** or **venn** (pyvenn) for richer diagrams. "
-                            "Showing bar-chart fallback.")
+                    st.info("Install **venn** (pyvenn) to also see the geometric Venn diagram.")
+
+                st.markdown("**UpSet plot with region letters (use these to pick from dropdown):**")
+                fig_up = create_upset_figure(sets, keys, intersections)
+                if fig_up is not None:
+                    st.pyplot(fig_up);  plt.close(fig_up)
+                else:
+                    # No non-empty regions to draw; show the size summary instead.
                     fig_fb = create_summary_figure(intersections, keys)
                     st.pyplot(fig_fb);  plt.close(fig_fb)
 
