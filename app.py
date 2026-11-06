@@ -289,7 +289,7 @@ if password != PASSWORD:
 # ----- END Password Gate -----
 
 st.title("🧬 DNA String Tools")
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 Seq Search and/or ST Mapping", "🔁 Reverse Complement", "🧬 DNA & RNA Folding", "🌡️ Melting Temp Calculator", "🔗 Venn Diagrams"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🔍 Seq Search and/or ST Mapping", "🔁 Reverse Complement", "🧬 DNA & RNA Folding", "🌡️ Melting Temp Calculator", "🔗 Venn Diagrams", "🗻 3D Venn"])
 
 # Tab 1: Seq Search and/or ST Mapping
 with tab1:
@@ -1169,3 +1169,379 @@ with tab5:
     else:
         if venn_files and (len(venn_files) < 2 or len(venn_files) > 5):
             st.warning("Please upload 2 to 5 files for Venn diagram analysis.")
+
+
+# ============================================================================
+# Tab 6: 3D Venn (stacked-column overlaps) — merged from 3D_Venn_v2.py
+# ----------------------------------------------------------------------------
+# A 2-5 set Venn footprint lies flat in X-Y; every member of a *selected*
+# region rises as a stacked column in Z. Segment heights = that member's value
+# in each set it belongs to (e.g. R17 CPM per pool).
+#
+# Self-contained: all helpers are prefixed _v3d_ and all widget keys start with
+# "v3d_" so nothing collides with the other tabs. Needs plotly; if plotly is
+# not installed, only this tab shows a message — the rest of the app still runs.
+# ============================================================================
+import math as _v3d_math
+from collections import defaultdict as _v3d_defaultdict
+
+try:
+    import plotly.graph_objects as _v3d_go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
+_V3D_ELLIPSE_PARAMS = {
+    2: [(0.375, 0.500, 0.50, 0.50, 0.0), (0.625, 0.500, 0.50, 0.50, 0.0)],
+    3: [(0.333, 0.633, 0.50, 0.50, 0.0), (0.666, 0.633, 0.50, 0.50, 0.0),
+        (0.500, 0.310, 0.50, 0.50, 0.0)],
+    4: [(0.350, 0.400, 0.72, 0.45, 140.0), (0.450, 0.500, 0.72, 0.45, 140.0),
+        (0.544, 0.500, 0.72, 0.45, 40.0), (0.644, 0.400, 0.72, 0.45, 40.0)],
+    5: [(0.428, 0.449, 0.87, 0.50, 155.0), (0.469, 0.543, 0.87, 0.50, 82.0),
+        (0.558, 0.523, 0.87, 0.50, 10.0), (0.578, 0.470, 0.87, 0.50, 118.0),
+        (0.489, 0.420, 0.87, 0.50, 46.0)],
+}
+
+_V3D_PALETTE = ["#7B5EA7", "#5B7FB5", "#4FA39A", "#5FA85F", "#E8C44D", "#E1737A"]
+
+# 12 triangles of a box given 8 corner vertices (0-3 bottom, 4-7 top)
+_V3D_BOX_TRI = [(0, 1, 2), (0, 2, 3), (4, 5, 6), (4, 6, 7), (0, 1, 5), (0, 5, 4),
+                (1, 2, 6), (1, 6, 5), (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)]
+
+
+def _v3d_ellipses(n, scale):
+    out = []
+    for (x, y, w, h, a) in _V3D_ELLIPSE_PARAMS[n]:
+        out.append((x * scale, y * scale, (w / 2) * scale, (h / 2) * scale, _v3d_math.radians(a)))
+    return out
+
+
+def _v3d_ellipse_outline(e, n=140):
+    cx, cy, rx, ry, th = e
+    t = np.linspace(0, 2 * _v3d_math.pi, n)
+    ex, ey = rx * np.cos(t), ry * np.sin(t)
+    X = cx + ex * _v3d_math.cos(th) - ey * _v3d_math.sin(th)
+    Y = cy + ex * _v3d_math.sin(th) + ey * _v3d_math.cos(th)
+    return X, Y
+
+
+@st.cache_data(show_spinner=False)
+def _v3d_region_grid(n, scale, grid):
+    """Sample the plane and label each pixel with its region bitcode (bit i set
+    => inside ellipse i). Returns (PX, PY, code). Cached so toggling regions is cheap."""
+    ells = _v3d_ellipses(n, scale)
+    gx = np.linspace(0, scale, grid)
+    PX, PY = np.meshgrid(gx, gx)
+    code = np.zeros(PX.shape, dtype=int)
+    for i, (cx, cy, rx, ry, th) in enumerate(ells):
+        dx, dy = PX - cx, PY - cy
+        xr = dx * _v3d_math.cos(th) + dy * _v3d_math.sin(th)
+        yr = -dx * _v3d_math.sin(th) + dy * _v3d_math.cos(th)
+        code += (1 << i) * (((xr / rx) ** 2 + (yr / ry) ** 2) <= 1)
+    return PX, PY, code
+
+
+def _v3d_enumerate_regions(sets):
+    """sets: {name: {member: value}} -> dict[region_tuple, list[member]]."""
+    names = list(sets)
+    region_members = _v3d_defaultdict(list)
+    allmem = set().union(*[set(d) for d in sets.values()]) if sets else set()
+    for m in allmem:
+        memb = tuple(nm for nm in names if m in sets[nm])
+        if memb:
+            region_members[memb].append(m)
+    return dict(region_members)
+
+
+def _v3d_region_label(memb, count):
+    name = f"{memb[0]} (only)" if len(memb) == 1 else " \u2229 ".join(memb)
+    return f"{name}  \u2014  {count} seq"
+
+
+def _v3d_autofit_scale(region_caps, cluster_spacing, target_frac=0.20, floor=12.0, ceiling=80.0):
+    if not region_caps:
+        return floor
+    e_max = max(_v3d_math.ceil(_v3d_math.sqrt(max(n, 1))) * cluster_spacing for n in region_caps)
+    return float(min(ceiling, max(floor, e_max / target_frac)))
+
+
+def _v3d_build_figure(sets, selected_regions, height_transform="sqrt",
+                      max_per_lobe=500, colors=None, scale=10.0,
+                      bar_halfwidth=0.05, cluster_spacing=0.17, grid=600,
+                      title=None):
+    go = _v3d_go
+    names = list(sets)
+    n = len(names)
+    if n not in _V3D_ELLIPSE_PARAMS:
+        raise ValueError(f"Supported set counts are 2-5 (got {n}).")
+    colors = colors or {nm: _V3D_PALETTE[i % len(_V3D_PALETTE)] for i, nm in enumerate(names)}
+    idx = {nm: i for i, nm in enumerate(names)}
+
+    PX, PY, code = _v3d_region_grid(n, scale, grid)
+    ells = _v3d_ellipses(n, scale)
+
+    def centroid(memb):
+        target = sum(1 << idx[m] for m in memb)
+        mask = code == target
+        if not mask.any():
+            return (float(np.mean([ells[idx[m]][0] for m in memb])),
+                    float(np.mean([ells[idx[m]][1] for m in memb])))
+        return float(PX[mask].mean()), float(PY[mask].mean())
+
+    fig = go.Figure()
+
+    # flat Venn footprint: translucent fill + outline + label per set
+    for i, nm in enumerate(names):
+        X, Y = _v3d_ellipse_outline(ells[i])
+        cx, cy = ells[i][0], ells[i][1]
+        vx = np.concatenate([[cx], X]); vy = np.concatenate([[cy], Y]); vz = np.zeros(len(vx))
+        fig.add_trace(go.Mesh3d(x=vx, y=vy, z=vz, i=[0] * (len(X) - 1),
+                                j=list(range(1, len(X))), k=list(range(2, len(X) + 1)),
+                                color=colors[nm], opacity=0.10, hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter3d(x=X, y=Y, z=np.zeros(len(X)), mode="lines",
+                                   line=dict(color=colors[nm], width=3), opacity=0.45,
+                                   hoverinfo="skip", showlegend=False))
+        lx, ly = centroid((nm,))
+        fig.add_trace(go.Scatter3d(x=[lx], y=[ly], z=[0], mode="text", text=[nm],
+                                   textfont=dict(size=13, color=colors[nm]),
+                                   hoverinfo="skip", showlegend=False))
+
+    # collect rendered members per selected region (capped)
+    region_members = _v3d_enumerate_regions(sets)
+    sel = set(tuple(r) for r in selected_regions)
+    render = {}
+    totals_all = []
+    for memb, ms in region_members.items():
+        if memb not in sel:
+            continue
+        ms_sorted = sorted(ms, key=lambda m: sum(sets[nm][m] for nm in memb),
+                           reverse=True)[:max_per_lobe]
+        if ms_sorted:
+            render[memb] = ms_sorted
+            totals_all.extend(sum(sets[nm][m] for nm in memb) for m in ms_sorted)
+    maxtot = max(totals_all, default=1.0) or 1.0
+    max_h = scale * 0.45  # column height scales with the plane so bars stay readable
+
+    def col_height(total):
+        if height_transform == "linear":
+            return total / maxtot * max_h
+        if height_transform == "normalized":
+            return max_h * 0.6
+        return _v3d_math.sqrt(max(total, 0.0)) / _v3d_math.sqrt(maxtot) * max_h  # 'sqrt'
+
+    # stacked columns, merged into one mesh per set for speed
+    verts = {nm: [] for nm in names}; faces = {nm: [] for nm in names}; htext = {nm: [] for nm in names}
+
+    def add_box(nm, cx, cy, z0, z1, hover):
+        b = len(verts[nm]); hw = bar_halfwidth
+        verts[nm].extend([(cx - hw, cy - hw, z0), (cx + hw, cy - hw, z0),
+                          (cx + hw, cy + hw, z0), (cx - hw, cy + hw, z0),
+                          (cx - hw, cy - hw, z1), (cx + hw, cy - hw, z1),
+                          (cx + hw, cy + hw, z1), (cx - hw, cy + hw, z1)])
+        htext[nm].extend([hover] * 8)
+        faces[nm].extend([(b + a, b + bb, b + c) for a, bb, c in _V3D_BOX_TRI])
+
+    n_cols = 0
+    for memb, ms in render.items():
+        cx0, cy0 = centroid(memb)
+        cols = max(1, _v3d_math.ceil(_v3d_math.sqrt(len(ms))))
+        rows = _v3d_math.ceil(len(ms) / cols)
+        for k, m in enumerate(ms):
+            seg = {nm: sets[nm][m] for nm in memb}
+            tot = sum(seg.values())
+            if tot <= 0:
+                continue
+            gxp, gyp = k % cols, k // cols
+            cx = cx0 + (gxp - (cols - 1) / 2) * cluster_spacing
+            cy = cy0 + (gyp - (rows - 1) / 2) * cluster_spacing
+            dom = max(seg, key=seg.get); domsh = seg[dom] / tot * 100
+            H = col_height(tot); z = 0.0
+            valstr = "  ".join(f"{nm}={seg[nm]:.0f}" for nm in memb)
+            rname = memb[0] + " only" if len(memb) == 1 else " & ".join(memb)
+            for nm in memb:
+                h = H * seg[nm] / tot
+                hover = (f"{m}<br>region: {rname}<br>"
+                         f"dominant {dom} = {domsh:.0f}%<br>{valstr}")
+                add_box(nm, cx, cy, z, z + h, hover); z += h
+            n_cols += 1
+
+    for nm in names:
+        if verts[nm]:
+            vx, vy, vz = zip(*verts[nm]); ii, jj, kk = zip(*faces[nm])
+            fig.add_trace(go.Mesh3d(x=vx, y=vy, z=vz, i=ii, j=jj, k=kk, color=colors[nm],
+                                    opacity=1.0, hovertext=htext[nm], hoverinfo="text",
+                                    flatshading=True, showlegend=False))
+
+    for nm in names:  # legend swatches
+        fig.add_trace(go.Scatter3d(x=[None], y=[None], z=[None], mode="markers",
+                                   marker=dict(size=9, color=colors[nm]), name=nm))
+
+    sub = {"sqrt": "height \u221d \u221a(total value)", "linear": "height \u221d total value",
+           "normalized": "all columns equal height (dominance only)"}[height_transform]
+    fig.update_layout(
+        title=dict(text=(title or "Venn footprint + stacked columns") +
+                   f"<br><sub>{sub}; segments = per-set share &#183; {n_cols} columns shown</sub>", x=0.5),
+        scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False),
+                   zaxis=dict(title="stacked value", backgroundcolor="white"),
+                   aspectmode="data", camera=dict(eye=dict(x=0.2, y=-1.7, z=1.5))),
+        legend=dict(itemsizing="constant"), height=820, margin=dict(l=0, r=0, t=70, b=0),
+        hoverlabel=dict(font=dict(family="Courier New, monospace", size=12)))
+    return fig
+
+
+def _v3d_guess_value_col(cols):
+    """Return index into ['(presence = 1)'] + cols for a likely CPM/count column."""
+    priority = ["cpm", "round 17", "r17", "total frequency", "total", "count", "freq", "reads"]
+    low = [str(c).lower() for c in cols]
+    for key in priority:
+        for j, name in enumerate(low):
+            if key in name:
+                return j + 1  # +1 because index 0 is the presence option
+    return 0
+
+
+def _v3d_parse_file_to_dict(file, seqcol, valcol):
+    """Return {sequence(upper): summed value} for one uploaded file."""
+    ext = file.name.split(".")[-1].lower()
+    d = _v3d_defaultdict(float)
+    if ext in ("fastq", "fq"):
+        file.seek(0)
+        lines = file.read().decode("utf-8", "ignore").splitlines()
+        for i in range(1, len(lines), 4):
+            s = lines[i].strip()
+            if s:
+                d[s.upper()] += 1.0  # value = read count
+        return dict(d)
+    file.seek(0)
+    df = pd.read_csv(file) if ext == "csv" else pd.read_excel(file)
+    seqser = df[seqcol].astype(str).str.upper().str.strip()
+    if valcol == "(presence = 1)":
+        valser = pd.Series(1.0, index=df.index)
+    else:
+        valser = pd.to_numeric(df[valcol], errors="coerce").fillna(0.0)
+    for s, v in zip(seqser, valser):
+        if s and s.lower() != "nan":
+            d[s] += float(v)
+    return dict(d)
+
+
+def _v3d_render_tab():
+    with st.expander("About / how to read this"):
+        st.write(
+            "Upload 2\u20135 sequence files. The Venn footprint lies flat; each member "
+            "of a **selected region** rises as a stacked column whose height reflects its "
+            "total value (e.g. R17 CPM) and whose coloured segments are its per-set share. "
+            "Use the **region picker** to switch any single-set lobe or any intersection on/off "
+            "(presets: *Intersections only*, *All lobes*, *Clear*). A tall single-colour column = "
+            "dominated by one set; a dominant segment plus a sliver = split across sets (leakage "
+            "shows up as the stack ratio). Drag to rotate, scroll to zoom, hover a column for details."
+        )
+
+    st.header("3D Venn \u2014 stacked-column overlaps")
+
+    if not PLOTLY_AVAILABLE:
+        st.error("plotly is not installed in this environment. Add `plotly` to "
+                 "requirements.txt and redeploy to use this tab.")
+        return
+
+    uploaded = st.file_uploader("Upload files (csv / xlsx / fastq / fq)",
+                                type=["csv", "xlsx", "fastq", "fq"],
+                                accept_multiple_files=True, key="v3d_files")
+    if not uploaded:
+        st.info("Upload 2\u20135 files to begin.")
+        return
+    if not (2 <= len(uploaded) <= 5):
+        st.warning("Please upload between 2 and 5 files.")
+        return
+
+    # per-file: label + sequence column + value/CPM column
+    st.subheader("Files & columns")
+    sets = {}
+    for i, file in enumerate(uploaded):
+        ext = file.name.split(".")[-1].lower()
+        with st.container():
+            st.markdown(f"**File {i + 1}: `{file.name}`**")
+            label = st.text_input("Label", value=file.name.rsplit(".", 1)[0], key=f"v3d_lbl{i}")
+            if ext in ("fastq", "fq"):
+                st.caption("FASTQ \u2192 value = read count (number of times each sequence appears).")
+                seqcol = valcol = None
+            else:
+                file.seek(0)
+                df_head = pd.read_csv(file, nrows=5) if ext == "csv" else pd.read_excel(file, nrows=5)
+                cols = list(df_head.columns)
+                st.dataframe(df_head, use_container_width=True, height=150)
+                c1, c2 = st.columns(2)
+                seq_default = cols.index("Trimmed") if "Trimmed" in cols else 0
+                seqcol = c1.selectbox("Sequence column", cols, index=seq_default, key=f"v3d_seq{i}")
+                val_opts = ["(presence = 1)"] + cols
+                valcol = c2.selectbox("Value / CPM column", val_opts,
+                                      index=_v3d_guess_value_col(cols), key=f"v3d_val{i}")
+            if label in sets:
+                label = f"{label}#{i + 1}"
+            try:
+                sets[label] = _v3d_parse_file_to_dict(file, seqcol, valcol)
+            except Exception as e:
+                st.error(f"Could not parse {file.name}: {e}")
+                return
+
+    # region enumeration
+    region_members = _v3d_enumerate_regions(sets)
+    ordered_membs = sorted(region_members, key=lambda t: (len(t), t))
+    label_to_memb = {_v3d_region_label(m, len(region_members[m])): m for m in ordered_membs}
+    ordered_labels = list(label_to_memb.keys())
+    inter_default = [lab for lab, m in label_to_memb.items() if len(m) >= 2]
+
+    # controls
+    st.subheader("Display controls")
+    cc1, cc2 = st.columns([1, 1])
+    height_transform = cc1.radio("Height scaling", ["sqrt", "linear", "normalized"],
+                                 horizontal=True, key="v3d_htf")
+    max_per_lobe = cc2.number_input("Max members per region (speed guard)",
+                                    min_value=10, max_value=20000, value=500, step=50, key="v3d_cap")
+
+    pc1, pc2, pc3 = st.columns(3)
+    bar_halfwidth = pc1.slider("Column width", 0.01, 0.15, 0.05, 0.005, key="v3d_bw")
+    cluster_spacing = pc2.slider("Column spacing", 0.05, 0.40, 0.17, 0.01, key="v3d_sp")
+    auto_fit = pc3.checkbox("Auto-size plane to fit", value=True, key="v3d_autofit")
+    manual_scale = pc3.slider("Plane size", 10, 60, 20, 1, key="v3d_scl", disabled=auto_fit)
+
+    # presets: must set session_state BEFORE the multiselect widget is created
+    if "v3d_regions_pick" not in st.session_state:
+        st.session_state["v3d_regions_pick"] = inter_default
+    else:
+        st.session_state["v3d_regions_pick"] = [l for l in st.session_state["v3d_regions_pick"]
+                                                if l in ordered_labels]
+    b1, b2, b3 = st.columns(3)
+    if b1.button("Intersections only", use_container_width=True, key="v3d_btn_inter"):
+        st.session_state["v3d_regions_pick"] = inter_default
+    if b2.button("All lobes", use_container_width=True, key="v3d_btn_all"):
+        st.session_state["v3d_regions_pick"] = list(ordered_labels)
+    if b3.button("Clear", use_container_width=True, key="v3d_btn_clear"):
+        st.session_state["v3d_regions_pick"] = []
+
+    picked = st.multiselect("Regions to show (single-set lobes and intersections)",
+                            ordered_labels, key="v3d_regions_pick")
+
+    if not picked:
+        st.warning("Select at least one region (or use a preset above).")
+        return
+
+    selected_membs = [label_to_memb[l] for l in picked]
+    capped_note = any(len(region_members[m]) > max_per_lobe for m in selected_membs)
+    capped_counts = [min(len(region_members[m]), int(max_per_lobe)) for m in selected_membs]
+    scale = _v3d_autofit_scale(capped_counts, cluster_spacing) if auto_fit else float(manual_scale)
+    fig = _v3d_build_figure(sets, selected_membs,
+                            height_transform=height_transform,
+                            max_per_lobe=int(max_per_lobe),
+                            scale=scale, bar_halfwidth=bar_halfwidth,
+                            cluster_spacing=cluster_spacing)
+    st.plotly_chart(fig, use_container_width=True)
+    total_shown = sum(capped_counts)
+    st.caption(f"{len(selected_membs)} regions \u00b7 {total_shown} columns \u00b7 "
+               f"plane size {scale:.0f} ({'auto' if auto_fit else 'manual'})"
+               + ("  \u2014  some regions capped by the speed guard; raise it to show all."
+                  if capped_note else ""))
+
+
+with tab6:
+    _v3d_render_tab()
